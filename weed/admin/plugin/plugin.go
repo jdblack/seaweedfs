@@ -65,6 +65,9 @@ type Plugin struct {
 	schedulerMu       sync.Mutex
 	nextDetectionAt   map[string]time.Time
 	detectionInFlight map[string]bool
+	// startedAt is when this plugin began serving. The scheduler gives the
+	// cluster a settling window after it before the first scan of each job type.
+	startedAt time.Time
 
 	detectorLeaseMu sync.Mutex
 	detectorLeases  map[string]string
@@ -177,6 +180,7 @@ func New(options Options) (*Plugin, error) {
 		outgoingBuffer:            bufferSize,
 		sendTimeout:               sendTimeout,
 		schedulerTick:             schedulerTick,
+		startedAt:                 time.Now().UTC(),
 		clusterContextProvider:    options.ClusterContextProvider,
 		configDefaultsProvider:    options.ConfigDefaultsProvider,
 		lockManager:               options.LockManager,

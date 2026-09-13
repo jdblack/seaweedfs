@@ -36,6 +36,11 @@ const (
 	maxEstimatedRuntimeCap                     = 8 * time.Hour
 	// How long started jobs may drain past the run window close.
 	scheduledExecutionDrainGrace = 30 * time.Minute
+	// maxStartupSettleWindow caps how long a freshly started process waits for
+	// the cluster to settle before its first scan. A deploy settles in minutes,
+	// so waiting longer buys nothing and would postpone the first scan of a
+	// process whose detection interval is hours long.
+	maxStartupSettleWindow = 30 * time.Minute
 )
 
 type schedulerPolicy struct {
@@ -137,6 +142,15 @@ type dueJobType struct {
 	policy  schedulerPolicy
 }
 
+// startupSettleWindow is how long a freshly started process waits before its
+// first scan: one detection interval, capped by maxStartupSettleWindow.
+func startupSettleWindow(interval time.Duration) time.Duration {
+	if interval <= 0 || interval > maxStartupSettleWindow {
+		return maxStartupSettleWindow
+	}
+	return interval
+}
+
 // collectDueJobTypes loads policies for all job types in the lane and
 // returns those whose detection interval has elapsed. It also returns
 // the full set of active job type names for later pruning.
@@ -157,6 +171,15 @@ func (r *Plugin) collectDueJobTypes(ls *schedulerLaneState, jobTypes []string) (
 		initialDelay := time.Duration(0)
 		if runInfo := r.snapshotSchedulerRun(jobType); runInfo.lastRunStartedAt.IsZero() {
 			initialDelay = 5 * time.Second
+		}
+		// Let the cluster settle before scanning it. A first scan seconds after
+		// startup lands while the master and the volume servers are still
+		// restarting and re-registering, and a half-populated topology reads as
+		// damage: ec_vacuum reported 665 of 674 volumes "missing a data shard"
+		// only because the holder of that shard had not checked in yet. Only the
+		// first scan of this process moves; the cadence after it is unchanged.
+		if settle := time.Until(r.startedAt.Add(startupSettleWindow(policy.DetectionInterval))); settle > initialDelay {
+			initialDelay = settle
 		}
 		if !r.markDetectionDue(jobType, policy.DetectionInterval, initialDelay) {
 			continue
