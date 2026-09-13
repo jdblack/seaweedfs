@@ -114,7 +114,7 @@ func (t *Topology) CollectionStatistics() []*CollectionStatistics {
 					message := ecInfo.ToVolumeEcShardInformationMessage()
 					stats := statsFor(ecInfo.Collection)
 					stats.PhysicalSize += uint64(erasure_coding.EcShardsTotalSize(message))
-					stats.Size += uint64(erasure_coding.EcShardsDataSize(message, 0))
+					stats.Size += uint64(erasure_coding.EcShardsDataSize(message, ecInfo.DataShardsOrDefault()))
 
 					key := ecStatsKey{collection: ecInfo.Collection, volumeId: ecInfo.VolumeId}
 					counts, found := perEcVolume[key]

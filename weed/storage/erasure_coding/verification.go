@@ -77,8 +77,8 @@ func VerifyShardsAcrossServers(ctx context.Context, volumeID uint32,
 // keeping the source next to live shards is the more dangerous mixed state.
 // Below dataShards it returns an error and the source must be kept.
 // dataShards/totalShards are passed as parameters (not derived from the
-// package constants) so enterprise builds with custom EC ratios share this
-// helper verbatim.
+// package constants) so callers with custom EC ratios share this helper
+// verbatim.
 func RequireRecoverableShardSet(volumeID uint32, shardsPresent ShardBits, dataShards, totalShards int) (degraded bool, err error) {
 	if totalShards <= 0 || totalShards > MaxShardCount {
 		return false, fmt.Errorf("invalid totalShards %d for volume %d (must be in [1, %d])",

@@ -378,6 +378,7 @@ func CollectEcShardIds(topoInfo *master_pb.TopologyInfo, collectionMatcher *wild
 
 func collectEcNodeShardsInfo(topoInfo *master_pb.TopologyInfo, vid needle.VolumeId) (map[pb.ServerAddress]*erasure_coding.ShardsInfo, int) {
 	res := make(map[pb.ServerAddress]*erasure_coding.ShardsInfo)
+	dataShards := 0
 	EachDataNode(topoInfo, func(dc DataCenterId, rack RackId, dn *master_pb.DataNodeInfo) {
 		// Union across ALL disk-type buckets and, within a node, across its
 		// physical disks. Shards sit wherever encode generation and balance
@@ -391,6 +392,12 @@ func collectEcNodeShardsInfo(topoInfo *master_pb.TopologyInfo, vid needle.Volume
 			}
 			for _, v := range diskInfo.EcShardInfos {
 				if v.Id == uint32(vid) {
+					// The volume's own ratio drives the decode's data-shard
+					// requirement; a 3+2 volume needs only 3 data shards, not
+					// the build default 10.
+					if dataShards == 0 {
+						dataShards = erasure_coding.EcShardsVolumeDataShards(v)
+					}
 					addr := pb.NewServerAddressFromDataNode(dn)
 					si := erasure_coding.ShardsInfoFromVolumeEcShardInformationMessage(v)
 					if existing, ok := res[addr]; ok {
@@ -403,8 +410,10 @@ func collectEcNodeShardsInfo(topoInfo *master_pb.TopologyInfo, vid needle.Volume
 		}
 	})
 
-	// OSS is always 10+4; the per-volume ratio override lives in the enterprise build.
-	return res, erasure_coding.DataShardsCount
+	if dataShards == 0 {
+		dataShards = erasure_coding.DataShardsCount
+	}
+	return res, dataShards
 }
 
 type DecodeDiskUsageState struct {
@@ -416,6 +425,9 @@ type decodeDiskUsageCounts struct {
 	volumeCount       int64
 	remoteVolumeCount int64
 	ecShardCount      int64
+	// dataShards is the node's EC ratio (shards per volume slot); used to convert
+	// its EC shard count to volume slots without assuming the build default.
+	dataShards int
 }
 
 func NewDecodeDiskUsageState(topoInfo *master_pb.TopologyInfo, diskType types.DiskType) *DecodeDiskUsageState {
@@ -427,6 +439,7 @@ func NewDecodeDiskUsageState(topoInfo *master_pb.TopologyInfo, diskType types.Di
 				volumeCount:       diskInfo.VolumeCount,
 				remoteVolumeCount: diskInfo.RemoteVolumeCount,
 				ecShardCount:      int64(CountShards(diskInfo.EcShardInfos)),
+				dataShards:        erasure_coding.ShardsPerVolumeSlot(diskInfo.EcShardInfos),
 			}
 		}
 	})
@@ -442,7 +455,11 @@ func (state *DecodeDiskUsageState) freeVolumeCount(location pb.ServerAddress) (i
 		return 0, false
 	}
 	free := usage.maxVolumeCount - (usage.volumeCount - usage.remoteVolumeCount)
-	free -= (usage.ecShardCount + int64(erasure_coding.DataShardsCount) - 1) / int64(erasure_coding.DataShardsCount)
+	dataShards := int64(usage.dataShards)
+	if dataShards <= 0 {
+		dataShards = int64(erasure_coding.DataShardsCount)
+	}
+	free -= (usage.ecShardCount + dataShards - 1) / dataShards
 	return free, true
 }
 

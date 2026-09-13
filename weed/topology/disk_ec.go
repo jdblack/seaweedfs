@@ -43,6 +43,13 @@ func (d *Disk) AddOrUpdateEcShard(s *erasure_coding.EcVolumeInfo) {
 		oldCount := existing.ShardsInfo.Count()
 		existing.ShardsInfo.Add(s.ShardsInfo)
 		delta = existing.ShardsInfo.Count() - oldCount
+		// Refresh the ratio when this update carries one but the stored entry
+		// predates ratio tracking (0/0), e.g. a volume first seen by an old
+		// volume server and later re-reported by an upgraded one.
+		if s.DataShards > 0 && s.ParityShards > 0 && existing.DataShards == 0 && existing.ParityShards == 0 {
+			existing.DataShards = s.DataShards
+			existing.ParityShards = s.ParityShards
+		}
 	}
 
 	if delta != 0 {

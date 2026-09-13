@@ -40,6 +40,7 @@ func (s *AdminServer) GetClusterEcShards(page int, pageSize int, sortBy string, 
 
 	var ecShards []EcShardWithInfo
 	volumeShardsMap := make(map[uint32]map[int]bool) // volumeId -> set of shards present
+	volumeRatios := make(map[uint32]ecVolumeRatio)   // volumeId -> ratio recorded on its EC message
 	volumesWithAllShards := 0
 	volumesWithMissingShards := 0
 
@@ -66,6 +67,8 @@ func (s *AdminServer) GetClusterEcShards(page int, pageSize int, sortBy string, 
 
 								// Create individual shard entries for each shard this server has
 								shardBits := ecShardInfo.EcIndexBits
+								ratio := ecShardRatio(ecShardInfo)
+								volumeRatios[volumeId] = ratio
 								shardsInfo := erasure_coding.ShardsInfoFromVolumeEcShardInformationMessage(ecShardInfo)
 								for shardId := 0; shardId < erasure_coding.MaxShardCount; shardId++ {
 									if (shardBits & (1 << uint(shardId))) != 0 {
@@ -84,6 +87,8 @@ func (s *AdminServer) GetClusterEcShards(page int, pageSize int, sortBy string, 
 											ModifiedTime: 0, // Not available in current API
 											EcIndexBits:  ecShardInfo.EcIndexBits,
 											ShardCount:   getShardCount(ecShardInfo.EcIndexBits),
+											DataShards:   ratio.dataShards,
+											ParityShards: ratio.parityShards,
 										}
 										ecShards = append(ecShards, ecShard)
 									}
@@ -110,15 +115,17 @@ func (s *AdminServer) GetClusterEcShards(page int, pageSize int, sortBy string, 
 		var missingShards []int
 		shardCount := len(shardsPresent)
 
-		// Find which shards are missing for this volume across ALL servers
-		// Uses default 10+4 (14 total shards)
-		for shardId := 0; shardId < erasure_coding.TotalShardsCount; shardId++ {
+		// Find which shards are missing for this volume across ALL servers,
+		// against the volume's own data+parity count. The ratio falls back to
+		// the build default (10+4) when the message carries none.
+		ratio := volumeRatios[volumeId]
+		for shardId := 0; shardId < ratio.total; shardId++ {
 			if !shardsPresent[shardId] {
 				missingShards = append(missingShards, shardId)
 			}
 		}
 
-		isComplete := (shardCount == erasure_coding.TotalShardsCount)
+		isComplete := (shardCount == ratio.total)
 		volumeCompleteness[volumeId] = isComplete
 		volumeMissingShards[volumeId] = missingShards
 
@@ -295,6 +302,11 @@ func (s *AdminServer) GetClusterEcVolumes(page int, pageSize int, sortBy string,
 
 								volume := volumeData[volumeId]
 
+								// Record the volume's own EC ratio (falling back to the
+								// build default) so completeness reflects its layout.
+								volume.DataShards = erasure_coding.EcShardsVolumeDataShards(ecShardInfo)
+								volume.ParityShards = erasure_coding.EcShardsVolumeParityShards(ecShardInfo)
+
 								// Track data centers and servers
 								dcExists := false
 								for _, existingDc := range volume.DataCenters {
@@ -369,9 +381,17 @@ func (s *AdminServer) GetClusterEcVolumes(page int, pageSize int, sortBy string,
 	for _, volume := range volumeData {
 		volume.TotalShards = len(volume.ShardLocations)
 
-		// Find missing shards (default 10+4 = 14 total shards)
+		// Expected shard count comes from the volume's own ratio; 0/0 falls back
+		// to the build default so a pre-upgrade 10+4 volume still reads complete.
+		expectedShards := volume.DataShards + volume.ParityShards
+		if expectedShards <= 0 {
+			expectedShards = erasure_coding.TotalShardsCount
+		}
+		volume.ExpectedShards = expectedShards
+
+		// Find missing shards against this volume's total.
 		var missingShards []int
-		for shardId := 0; shardId < erasure_coding.TotalShardsCount; shardId++ {
+		for shardId := 0; shardId < expectedShards; shardId++ {
 			if _, exists := volume.ShardLocations[shardId]; !exists {
 				missingShards = append(missingShards, shardId)
 			}
@@ -605,6 +625,8 @@ func (s *AdminServer) GetEcVolumeDetails(volumeID uint32, sortBy string, sortOrd
 												ModifiedTime: 0, // Not available in current API
 												EcIndexBits:  ecShardInfo.EcIndexBits,
 												ShardCount:   getShardCount(ecShardInfo.EcIndexBits),
+												DataShards:   erasure_coding.EcShardsVolumeDataShards(ecShardInfo),
+												ParityShards: erasure_coding.EcShardsVolumeParityShards(ecShardInfo),
 											}
 											shards = append(shards, ecShard)
 										}
@@ -635,12 +657,22 @@ func (s *AdminServer) GetEcVolumeDetails(volumeID uint32, sortBy string, sortOrd
 	}
 
 	totalUniqueShards := len(foundShards)
-	// Check completeness using default 10+4 (14 total shards)
-	isComplete := (totalUniqueShards == erasure_coding.TotalShardsCount)
+
+	// The volume's own ratio drives completeness; 0/0 falls back to the build
+	// default (10+4) so a pre-upgrade volume still reads as complete.
+	dataShards, parityShards := 0, 0
+	if len(shards) > 0 {
+		dataShards, parityShards = shards[0].DataShards, shards[0].ParityShards
+	}
+	expectedShards := dataShards + parityShards
+	if expectedShards <= 0 {
+		expectedShards = erasure_coding.TotalShardsCount
+	}
+	isComplete := (totalUniqueShards == expectedShards)
 
 	// Calculate missing shards
 	var missingShards []int
-	for i := 0; i < erasure_coding.TotalShardsCount; i++ {
+	for i := 0; i < expectedShards; i++ {
 		if !foundShards[i] {
 			missingShards = append(missingShards, i)
 		}
@@ -666,17 +698,20 @@ func (s *AdminServer) GetEcVolumeDetails(volumeID uint32, sortBy string, sortOrd
 	}
 
 	data := &EcVolumeDetailsData{
-		VolumeID:      volumeID,
-		Collection:    collection,
-		Shards:        shards,
-		TotalShards:   totalUniqueShards,
-		IsComplete:    isComplete,
-		MissingShards: missingShards,
-		DataCenters:   dcList,
-		Servers:       serverList,
-		LastUpdated:   time.Now(),
-		SortBy:        sortBy,
-		SortOrder:     sortOrder,
+		VolumeID:       volumeID,
+		Collection:     collection,
+		Shards:         shards,
+		TotalShards:    totalUniqueShards,
+		DataShards:     dataShards,
+		ParityShards:   parityShards,
+		ExpectedShards: expectedShards,
+		IsComplete:     isComplete,
+		MissingShards:  missingShards,
+		DataCenters:    dcList,
+		Servers:        serverList,
+		LastUpdated:    time.Now(),
+		SortBy:         sortBy,
+		SortOrder:      sortOrder,
 	}
 
 	return data, nil

@@ -414,7 +414,7 @@ func capacityByMaxVolumeCount(diskType types.DiskType) CapacityFunc {
 		for _, ecShardInfo := range diskInfo.EcShardInfos {
 			ecShardCount += erasure_coding.GetShardCount(ecShardInfo)
 		}
-		return float64(diskInfo.MaxVolumeCount) - float64(ecShardCount)/erasure_coding.DataShardsCount
+		return float64(diskInfo.MaxVolumeCount) - float64(ecShardCount)/float64(erasure_coding.ShardsPerVolumeSlot(diskInfo.EcShardInfos))
 	}
 }
 
@@ -428,7 +428,7 @@ func capacityByFreeVolumeCount(diskType types.DiskType) CapacityFunc {
 		for _, ecShardInfo := range diskInfo.EcShardInfos {
 			ecShardCount += erasure_coding.GetShardCount(ecShardInfo)
 		}
-		return float64(diskInfo.MaxVolumeCount-diskInfo.VolumeCount) - float64(ecShardCount)/erasure_coding.DataShardsCount
+		return float64(diskInfo.MaxVolumeCount-diskInfo.VolumeCount) - float64(ecShardCount)/float64(erasure_coding.ShardsPerVolumeSlot(diskInfo.EcShardInfos))
 	}
 }
 

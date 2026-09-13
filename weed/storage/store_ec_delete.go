@@ -63,7 +63,11 @@ func (s *Store) doDeleteNeedleFromAtLeastOneRemoteEcShards(ecVolume *erasure_cod
 	// Primary data shard has no live holders; fall back to any other shard
 	// (remaining data shards first, then parity) so a shard holder can still
 	// tombstone the .ecx and the delete is durable.
-	for shardId := erasure_coding.ShardId(0); shardId < erasure_coding.TotalShardsCount; shardId++ {
+	totalShards := ecVolume.ECDataShards() + ecVolume.ECParityShards()
+	if totalShards <= 0 {
+		totalShards = erasure_coding.TotalShardsCount
+	}
+	for shardId := erasure_coding.ShardId(0); shardId < erasure_coding.ShardId(totalShards); shardId++ {
 		if shardId == primaryShardId {
 			continue
 		}

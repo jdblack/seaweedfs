@@ -6,6 +6,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/admin/config"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/worker_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"github.com/seaweedfs/seaweedfs/weed/worker/tasks/base"
 )
 
@@ -18,6 +19,12 @@ type Config struct {
 	MinSizeMB        int      `json:"min_size_mb"`
 	PreferredTags    []string `json:"preferred_tags"`
 	ReplicaPlacement string   `json:"replica_placement"` // e.g. "020"; empty falls back to the master default replication
+	// fork: configurable EC ratio; resolvers live in ec_ratio_fork.go
+	// DataShards and ParityShards are the Reed-Solomon ratio used for new
+	// encodes. A value <= 0 keeps the build default (erasure_coding.DataShardsCount /
+	// erasure_coding.ParityShardsCount), so an unset config behaves as before.
+	DataShards   int `json:"data_shards"`
+	ParityShards int `json:"parity_shards"`
 }
 
 // NewDefaultConfig creates a new default erasure coding configuration
@@ -33,6 +40,8 @@ func NewDefaultConfig() *Config {
 		CollectionFilter: "",
 		MinSizeMB:        30, // 30MB (more reasonable than 100MB)
 		PreferredTags:    nil,
+		DataShards:       erasure_coding.DataShardsCount,
+		ParityShards:     erasure_coding.ParityShardsCount,
 	}
 }
 
@@ -169,6 +178,38 @@ func GetConfigSpec() base.ConfigSpec {
 				HelpText:     "Leave empty to use the master default replication. When set, the 2nd/3rd digits cap EC shards per rack and per node (best-effort during encode: relaxed rather than failing if the cluster can't satisfy them, then enforced by rebalancing). The 1st (data-center) digit is ignored for EC placement",
 				Placeholder:  "020",
 				InputType:    "text",
+				CSSClasses:   "form-control",
+			},
+			{
+				Name:         "data_shards",
+				JSONName:     "data_shards",
+				Type:         config.FieldTypeInt,
+				DefaultValue: erasure_coding.DataShardsCount,
+				MinValue:     1,
+				MaxValue:     erasure_coding.MaxShardCount - 1,
+				Required:     false,
+				DisplayName:  "Data Shards",
+				Description:  "Number of Reed-Solomon data shards for each new EC volume",
+				HelpText:     "Each volume is split into this many data shards. Data plus parity must not exceed the maximum shard count (32). A value of 0 uses the build default",
+				Placeholder:  fmt.Sprint(erasure_coding.DataShardsCount),
+				Unit:         config.UnitCount,
+				InputType:    "number",
+				CSSClasses:   "form-control",
+			},
+			{
+				Name:         "parity_shards",
+				JSONName:     "parity_shards",
+				Type:         config.FieldTypeInt,
+				DefaultValue: erasure_coding.ParityShardsCount,
+				MinValue:     1,
+				MaxValue:     erasure_coding.MaxShardCount - 1,
+				Required:     false,
+				DisplayName:  "Parity Shards",
+				Description:  "Number of Reed-Solomon parity shards for each new EC volume",
+				HelpText:     "How many shards can be lost without data loss. Data plus parity must not exceed the maximum shard count (32). A value of 0 uses the build default",
+				Placeholder:  fmt.Sprint(erasure_coding.ParityShardsCount),
+				Unit:         config.UnitCount,
+				InputType:    "number",
 				CSSClasses:   "form-control",
 			},
 		},

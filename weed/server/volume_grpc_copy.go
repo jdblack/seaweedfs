@@ -781,10 +781,11 @@ func (vs *VolumeServer) ReceiveFile(stream volume_server_pb.VolumeServer_Receive
 					}
 					targetLocation = vs.store.Locations[fileInfo.DiskId]
 				} else {
-					// Pass the build's default data-shard count for the helper's
-					// free-slot maths; it's a parameter so custom-ratio builds
-					// (e.g. enterprise) can swap it without touching this file.
-					targetLocation = vs.store.FindEcShardTargetLocation(fileInfo.Collection, needle.VolumeId(fileInfo.VolumeId), erasure_coding.DataShardsCount)
+					// Pass the volume's own data-shard count for the helper's
+					// free-slot maths, so a custom-ratio volume is placed against
+					// the right capacity (falls back to the build default).
+					dataShards := vs.store.EcShardVolumeDataShards(fileInfo.Collection, needle.VolumeId(fileInfo.VolumeId))
+					targetLocation = vs.store.FindEcShardTargetLocation(fileInfo.Collection, needle.VolumeId(fileInfo.VolumeId), dataShards)
 				}
 				if targetLocation == nil {
 					glog.Errorf("ReceiveFile: no storage location available")

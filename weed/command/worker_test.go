@@ -18,6 +18,8 @@ func TestWorkerDefaultJobTypes(t *testing.T) {
 	want := []string{
 		"admin_script",
 		"ec_balance",
+		"ec_bitrot_scan",
+		"ec_vacuum",
 		"erasure_coding",
 		"iceberg_maintenance",
 		"s3_lifecycle",

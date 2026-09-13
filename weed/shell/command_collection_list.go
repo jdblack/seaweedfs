@@ -159,10 +159,9 @@ func collectCollectionInfo(t *master_pb.TopologyInfo, collectionInfos map[string
 
 						// EC shards are node-local, so data-shard sizes sum
 						// across nodes to give the logical volume size.
-						// Upstream OSS uses the fixed 10+4 ratio; forks with
-						// per-volume ratio metadata should pass the
-						// configured dataShards value here.
-						cif.Size += float64(erasure_coding.EcShardsDataSize(esi, 0))
+						// Use the volume's own ratio (falls back to the build
+						// default when its heartbeat carries none).
+						cif.Size += float64(erasure_coding.EcShardsDataSize(esi, erasure_coding.EcShardsVolumeDataShards(esi)))
 
 						key := volumeKey{collection: c, volumeId: esi.Id}
 						agg, ok := ecVolumes[key]

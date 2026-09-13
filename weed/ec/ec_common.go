@@ -372,7 +372,7 @@ func CountFreeShardSlots(dn *master_pb.DataNodeInfo, diskType types.DiskType) (c
 		return 0
 	}
 
-	slots := int(diskInfo.MaxVolumeCount-diskInfo.VolumeCount)*erasure_coding.DataShardsCount - CountShards(diskInfo.EcShardInfos)
+	slots := int(diskInfo.MaxVolumeCount-diskInfo.VolumeCount)*erasure_coding.ShardsPerVolumeSlot(diskInfo.EcShardInfos) - CountShards(diskInfo.EcShardInfos)
 	if slots < 0 {
 		return 0
 	}
@@ -843,9 +843,9 @@ func EcBalance(env *Env, collections []string, dc string, ecReplicaPlacement *su
 }
 
 // defaultECRatio resolves a collection's EC data/parity counts, defaulting to
-// the standard scheme. This is the admin-side plug-in point for custom ratios.
+// the standard scheme. It is the collection-level fallback used when a volume
+// reports no per-volume ratio of its own (see ecbalancer.VolumeShardRatio).
 func defaultECRatio(_ string) (int, int) {
-	// Custom EC ratios are an enterprise feature; OSS uses the standard scheme.
 	return erasure_coding.DataShardsCount, erasure_coding.ParityShardsCount
 }
 

@@ -147,14 +147,16 @@ func NewStore(
 			// The channel reader only starts after connecting to master, but we're loading during startup
 			select {
 			case s.NewEcShardsChan <- &master_pb.VolumeEcShardInformationMessage{
-				Id:          uint32(vid),
-				Collection:  collection,
-				EcIndexBits: si.Bitmap(),
-				ShardSizes:  si.SizesInt64(),
-				DiskType:    string(location.DiskType),
-				ExpireAtSec: ecVolume.ExpireAtSec,
-				DiskId:      diskId,
-				EncodeTsNs:  ecVolume.EncodeTsNs,
+				Id:           uint32(vid),
+				Collection:   collection,
+				EcIndexBits:  si.Bitmap(),
+				ShardSizes:   si.SizesInt64(),
+				DiskType:     string(location.DiskType),
+				ExpireAtSec:  ecVolume.ExpireAtSec,
+				DiskId:       diskId,
+				EncodeTsNs:   ecVolume.EncodeTsNs,
+				DataShards:   uint32(ecVolume.ECDataShards()),
+				ParityShards: uint32(ecVolume.ECParityShards()),
 			}:
 			default:
 				// Channel full during startup - this is OK, heartbeat will report EC shards later
@@ -295,9 +297,12 @@ func (s *Store) FindFreeLocation(filterFn func(location *DiskLocation) bool) (re
 			continue
 		}
 		currentFreeCount := location.MaxVolumeCount - int32(location.VolumesLen())
-		currentFreeCount *= erasure_coding.DataShardsCount
+		// One volume slot holds dataShards EC shards, so convert via the
+		// location's own ratio rather than the build default.
+		dataShards := int32(location.ecDataShardsOrDefault())
+		currentFreeCount *= dataShards
 		currentFreeCount -= int32(location.EcShardCount())
-		currentFreeCount /= erasure_coding.DataShardsCount
+		currentFreeCount /= dataShards
 		if currentFreeCount > max {
 			max = currentFreeCount
 			ret = location
@@ -1217,7 +1222,8 @@ func (s *Store) MaybeAdjustVolumeMax() (hasChanges bool) {
 			}
 			volCount := diskLocation.VolumesLen()
 			ecShardCount := diskLocation.EcShardCount()
-			maxVolumeCount := int32(volCount) + int32((ecShardCount+erasure_coding.DataShardsCount-1)/erasure_coding.DataShardsCount)
+			dataShards := diskLocation.ecDataShardsOrDefault()
+			maxVolumeCount := int32(volCount) + int32((ecShardCount+dataShards-1)/dataShards)
 			// One slot per full volume that fits in the unclaimed space.
 			// A "- 1" here used to zero the count when the disk had room for
 			// exactly one volume (free between 1x and 2x the limit), stranding

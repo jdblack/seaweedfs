@@ -146,6 +146,26 @@ func (h *ErasureCodingHandler) Descriptor() *plugin_pb.JobTypeDescriptor {
 							FieldType:   plugin_pb.ConfigFieldType_CONFIG_FIELD_TYPE_STRING,
 							Widget:      plugin_pb.ConfigWidget_CONFIG_WIDGET_TEXT,
 						},
+						{
+							Name:        "data_shards",
+							Label:       "Data Shards",
+							Description: "Reed-Solomon data shards for each new EC volume. Must be >= 1; data + parity must not exceed 32.",
+							FieldType:   plugin_pb.ConfigFieldType_CONFIG_FIELD_TYPE_INT64,
+							Widget:      plugin_pb.ConfigWidget_CONFIG_WIDGET_NUMBER,
+							Required:    true,
+							MinValue:    &plugin_pb.ConfigValue{Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: 1}},
+							MaxValue:    &plugin_pb.ConfigValue{Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: int64(ecstorage.MaxShardCount - 1)}},
+						},
+						{
+							Name:        "parity_shards",
+							Label:       "Parity Shards",
+							Description: "Reed-Solomon parity shards for each new EC volume. Must be >= 1; data + parity must not exceed 32.",
+							FieldType:   plugin_pb.ConfigFieldType_CONFIG_FIELD_TYPE_INT64,
+							Widget:      plugin_pb.ConfigWidget_CONFIG_WIDGET_NUMBER,
+							Required:    true,
+							MinValue:    &plugin_pb.ConfigValue{Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: 1}},
+							MaxValue:    &plugin_pb.ConfigValue{Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: int64(ecstorage.MaxShardCount - 1)}},
+						},
 					},
 				},
 			},
@@ -164,6 +184,12 @@ func (h *ErasureCodingHandler) Descriptor() *plugin_pb.JobTypeDescriptor {
 				},
 				"replica_placement": {
 					Kind: &plugin_pb.ConfigValue_StringValue{StringValue: ""},
+				},
+				"data_shards": {
+					Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: int64(ecstorage.DataShardsCount)},
+				},
+				"parity_shards": {
+					Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: int64(ecstorage.ParityShardsCount)},
 				},
 			},
 		},
@@ -623,6 +649,9 @@ func deriveErasureCodingWorkerConfig(values map[string]*plugin_pb.ConfigValue) *
 	taskConfig.PreferredTags = util.NormalizeTagList(pluginworker.ReadStringListConfig(values, "preferred_tags"))
 
 	taskConfig.ReplicaPlacement = strings.TrimSpace(pluginworker.ReadStringConfig(values, "replica_placement", taskConfig.ReplicaPlacement))
+
+	// fork: configurable EC ratio (helper in ec_ratio_fork.go)
+	applyConfiguredEcRatio(values, taskConfig)
 
 	return &erasureCodingWorkerConfig{
 		TaskConfig: taskConfig,

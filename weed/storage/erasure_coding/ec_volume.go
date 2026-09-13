@@ -556,19 +556,23 @@ func (ev *EcVolume) ToVolumeEcShardInformationMessage(diskId uint32) (messages [
 	ecInfoPerVolume := map[needle.VolumeId]*master_pb.VolumeEcShardInformationMessage{}
 
 	fileCount, deleteCount := ev.FileAndDeleteCount()
+	dataShards := uint32(ev.ECDataShards())
+	parityShards := uint32(ev.ECParityShards())
 
 	for _, s := range ev.Shards {
 		m, ok := ecInfoPerVolume[s.VolumeId]
 		if !ok {
 			m = &master_pb.VolumeEcShardInformationMessage{
-				Id:          uint32(s.VolumeId),
-				Collection:  s.Collection,
-				DiskType:    string(ev.diskType),
-				ExpireAtSec: ev.ExpireAtSec,
-				DiskId:      diskId,
-				FileCount:   fileCount,
-				DeleteCount: deleteCount,
-				EncodeTsNs:  ev.EncodeTsNs,
+				Id:           uint32(s.VolumeId),
+				Collection:   s.Collection,
+				DiskType:     string(ev.diskType),
+				ExpireAtSec:  ev.ExpireAtSec,
+				DiskId:       diskId,
+				FileCount:    fileCount,
+				DeleteCount:  deleteCount,
+				EncodeTsNs:   ev.EncodeTsNs,
+				DataShards:   dataShards,
+				ParityShards: parityShards,
 			}
 			ecInfoPerVolume[s.VolumeId] = m
 		}

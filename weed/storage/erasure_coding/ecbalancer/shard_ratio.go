@@ -6,19 +6,22 @@ import (
 )
 
 // shardDataShards returns the data-shard count of the volume an EC shard belongs
-// to, used to size the shard's disk footprint. OSS uses the standard ratio for
-// every volume; custom per-volume ratios are an enterprise feature, so the
-// enterprise build overrides this to read the per-shard ratio.
+// to, used to size the shard's disk footprint. It reads the volume's own ratio
+// (data_shards, field 20 of the EC shard heartbeat) and falls back to the build
+// default when the volume predates ratio tracking.
 func shardDataShards(eci *master_pb.VolumeEcShardInformationMessage) int {
-	return erasure_coding.DataShardsCount
+	return erasure_coding.EcShardsVolumeDataShards(eci)
 }
 
 // VolumeShardRatio returns the RAW per-volume (dataShards, parityShards) reported
-// on an EC shard's heartbeat, with 0 meaning "not reported". Custom per-volume
-// ratios are an enterprise feature and the OSS proto has no data_shards/parity_shards
-// fields, so this returns 0, 0 and the balancer falls back to the collection ratio
-// (the standard scheme). The enterprise build overrides this to read the per-shard
-// ratio so a mixed-ratio collection is spread by each volume's own data/parity split.
+// on an EC shard's heartbeat, with 0 meaning "not reported" so the balancer falls
+// back to the collection ratio (the standard scheme). The proto now carries
+// data_shards/parity_shards at fields 20/21 (matching the enterprise fork),
+// populated from the .vif; a pre-upgrade volume reports 0, 0 and keeps the
+// collection-keyed behavior.
 func VolumeShardRatio(eci *master_pb.VolumeEcShardInformationMessage) (dataShards, parityShards int) {
-	return 0, 0
+	if eci == nil {
+		return 0, 0
+	}
+	return int(eci.GetDataShards()), int(eci.GetParityShards())
 }

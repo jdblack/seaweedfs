@@ -3,7 +3,6 @@ package app
 import (
     "fmt"
     "github.com/seaweedfs/seaweedfs/weed/admin/dash"
-    "github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 )
 
 templ EcVolumeDetails(data dash.EcVolumeDetailsData) {
@@ -62,11 +61,11 @@ templ EcVolumeDetails(data dash.EcVolumeDetailsData) {
                             <td>
                                 if data.IsComplete {
                                     <span class="badge bg-success">
-                                        <i class="fas fa-check me-1"></i>Complete ({data.TotalShards}/{fmt.Sprintf("%d", erasure_coding.TotalShardsCount)} shards)
+                                        <i class="fas fa-check me-1"></i>Complete ({data.TotalShards}/{fmt.Sprintf("%d", data.ExpectedShards)} shards)
                                     </span>
                                 } else {
                                     <span class="badge bg-warning">
-                                        <i class="fas fa-exclamation-triangle me-1"></i>Incomplete ({data.TotalShards}/{fmt.Sprintf("%d", erasure_coding.TotalShardsCount)} shards)
+                                        <i class="fas fa-exclamation-triangle me-1"></i>Incomplete ({data.TotalShards}/{fmt.Sprintf("%d", data.ExpectedShards)} shards)
                                     </span>
                                 }
                             </td>
@@ -79,7 +78,7 @@ templ EcVolumeDetails(data dash.EcVolumeDetailsData) {
                                         if i > 0 { 
                                             <span>, </span>
                                         }
-                                        @renderEcShardBadge(uint32(shardID), true)
+                                        @renderEcShardBadge(uint32(shardID), data.DataShards, true)
                                     }
                                 </td>
                             </tr>
@@ -146,7 +145,7 @@ templ EcVolumeDetails(data dash.EcVolumeDetailsData) {
                         <h6>Present Shards:</h6>
                         <div class="d-flex flex-wrap gap-1">
                             for _, shard := range data.Shards {
-                                @renderEcShardBadge(shard.ShardID, false)
+                                @renderEcShardBadge(shard.ShardID, data.DataShards, false)
                             }
                         </div>
                         <div class="small text-muted mt-2">
@@ -158,7 +157,7 @@ templ EcVolumeDetails(data dash.EcVolumeDetailsData) {
                             <h6 class="mt-2">Missing Shards:</h6>
                             <div class="d-flex flex-wrap gap-1">
                                 for _, shardID := range data.MissingShards {
-                                    @renderEcShardBadge(uint32(shardID), true)
+                                    @renderEcShardBadge(uint32(shardID), data.DataShards, true)
                                 }
                             </div>
                         }
@@ -246,7 +245,7 @@ templ EcVolumeDetails(data dash.EcVolumeDetailsData) {
                             for _, shard := range data.Shards {
                                     <tr>
                                         <td>
-                                            @renderEcShardBadge(shard.ShardID, false)
+                                            @renderEcShardBadge(shard.ShardID, data.DataShards, false)
                                         </td>
                                         <td>
                                             <a href={ dash.PUrl(ctx, "/cluster/volume-servers/" + shard.Server) } class="text-primary text-decoration-none">
@@ -304,8 +303,8 @@ templ EcVolumeDetails(data dash.EcVolumeDetailsData) {
     </script>
 }
 
-templ renderEcShardBadge(shardID uint32, missing bool) {
-	if shardID < erasure_coding.DataShardsCount {
+templ renderEcShardBadge(shardID uint32, dataShards int, missing bool) {
+	if int(shardID) < dataShards {
 		if missing {
 			<span class="badge bg-primary opacity-50 me-1 mb-1" title={ fmt.Sprintf("Missing data shard %d", shardID) }>{ fmt.Sprintf("D%02d", shardID) }</span>
 		} else {

@@ -685,8 +685,10 @@ func waitForEcShardsToRegister(env *Env, volumeIds []needle.VolumeId) error {
 			for _, bits := range CollectEcShardBitsByNode(topoInfo, vid) {
 				union |= bits
 			}
-			if union.Count() < erasure_coding.TotalShardsCount {
-				lastMissing = append(lastMissing, fmt.Sprintf("volume %d: %d/%d shards", vid, union.Count(), erasure_coding.TotalShardsCount))
+			dataShards, parityShards := ecVolumeShardRatio(topoInfo, vid)
+			totalShards := dataShards + parityShards
+			if union.Count() < totalShards {
+				lastMissing = append(lastMissing, fmt.Sprintf("volume %d: %d/%d shards", vid, union.Count(), totalShards))
 			}
 		}
 		if len(lastMissing) == 0 {
@@ -828,8 +830,9 @@ func verifyEcShardsBeforeDelete(env *Env, volumeIds []needle.VolumeId, diskType 
 				union |= bits
 			}
 
-			totalShards := erasure_coding.TotalShardsCount
-			degraded, err := erasure_coding.RequireRecoverableShardSet(uint32(vid), union, erasure_coding.DataShardsCount, totalShards)
+			dataShards, parityShards := ecVolumeShardRatio(topoInfo, vid)
+			totalShards := dataShards + parityShards
+			degraded, err := erasure_coding.RequireRecoverableShardSet(uint32(vid), union, dataShards, totalShards)
 			if err != nil {
 				lastErr = fmt.Errorf("volume %d: %w (observed: %v)", vid, err, ecShardSummaryByNode(byNode))
 				break

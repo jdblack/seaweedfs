@@ -86,7 +86,7 @@ templ ClusterEcVolumes(data dash.ClusterEcVolumesData) {
                         <div>
                             <h6 class="card-title">Healthy Volumes</h6>
                             <h4 class="mb-0">{fmt.Sprintf("%d", data.CompleteVolumes)}</h4>
-                            <small>All { fmt.Sprintf("%d", erasure_coding.TotalShardsCount) } shards present</small>
+                            <small>All shards present</small>
                         </div>
                         <div class="align-self-center">
                             <i class="fas fa-check-circle fa-2x"></i>
@@ -117,8 +117,8 @@ templ ClusterEcVolumes(data dash.ClusterEcVolumesData) {
     <div class="alert alert-info mb-4" role="alert">
         <i class="fas fa-info-circle me-2"></i>
         <strong>EC Storage Note:</strong> 
-        EC volumes use erasure coding ({ fmt.Sprintf("%d+%d", erasure_coding.DataShardsCount, erasure_coding.ParityShardsCount) }) which stores data across { fmt.Sprintf("%d", erasure_coding.TotalShardsCount) } shards with redundancy. 
-        Physical storage is approximately { fmt.Sprintf("%.1fx", float64(erasure_coding.TotalShardsCount)/float64(erasure_coding.DataShardsCount)) } the original logical data size due to { fmt.Sprintf("%d", erasure_coding.ParityShardsCount) } parity shards.
+        EC volumes use erasure coding; the standard ratio is { fmt.Sprintf("%d+%d", erasure_coding.DataShardsCount, erasure_coding.ParityShardsCount) }, but it is recorded per volume so each volume below shows its own data+parity shard count. 
+        Physical storage is approximately total/data times the original logical data size.
     </div>
 
     <!-- Volumes Table -->
@@ -212,7 +212,7 @@ templ ClusterEcVolumes(data dash.ClusterEcVolumesData) {
                             </td>
                         }
                         <td>
-                            <span class="badge bg-primary">{fmt.Sprintf("%d/%d", volume.TotalShards, erasure_coding.TotalShardsCount)}</span>
+                            <span class="badge bg-primary">{fmt.Sprintf("%d/%d", volume.TotalShards, volume.ExpectedShards)}</span>
                         </td>
                         <td>
                             @displayShardSizes(volume.ShardSizes)
@@ -567,21 +567,21 @@ templ displayVolumeDistribution(volume dash.EcVolumeWithShards) {
 
 // displayEcVolumeStatus shows an improved status display for EC volumes.
 // Status thresholds are based on EC recovery capability:
-// - Critical: More than DataShardsCount missing (data is unrecoverable)
-// - Degraded: More than half of DataShardsCount missing (high risk)
-// - Incomplete: More than half of ParityShardsCount missing (reduced redundancy)
+// - Critical: More than the volume's data-shard count missing (data is unrecoverable)
+// - Degraded: More than half of the volume's data shards missing (high risk)
+// - Incomplete: More than half of the volume's parity shards missing (reduced redundancy)
 // - Minor Issues: Few shards missing (still fully recoverable)
 templ displayEcVolumeStatus(volume dash.EcVolumeWithShards) {
     if volume.IsComplete {
         <span class="badge bg-success"><i class="fas fa-check me-1"></i>Complete</span>
     } else {
-        if len(volume.MissingShards) > erasure_coding.DataShardsCount {
+        if len(volume.MissingShards) > volume.DataShards {
             // Unrecoverable: more shards missing than EC can reconstruct
             <span class="badge bg-danger"><i class="fas fa-skull me-1"></i>Critical ({fmt.Sprintf("%d", len(volume.MissingShards))} missing)</span>
-        } else if len(volume.MissingShards) > (erasure_coding.DataShardsCount/2) {
+        } else if len(volume.MissingShards) > (volume.DataShards / 2) {
             // High risk: approaching unrecoverable state
             <span class="badge bg-warning"><i class="fas fa-exclamation-triangle me-1"></i>Degraded ({fmt.Sprintf("%d", len(volume.MissingShards))} missing)</span>
-        } else if len(volume.MissingShards) > (erasure_coding.ParityShardsCount/2) {
+        } else if len(volume.MissingShards) > (volume.ParityShards / 2) {
             // Reduced redundancy but still recoverable
             <span class="badge bg-warning"><i class="fas fa-info-circle me-1"></i>Incomplete ({fmt.Sprintf("%d", len(volume.MissingShards))} missing)</span>
         } else {

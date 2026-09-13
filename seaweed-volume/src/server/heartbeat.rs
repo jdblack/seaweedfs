@@ -337,6 +337,8 @@ fn collect_ec_shard_delta_messages(
                         expire_at_sec: ec_vol.expire_at_sec,
                         disk_id: disk_id as u32,
                         encode_ts_ns: ec_vol.encode_ts_ns,
+                        data_shards: ec_vol.data_shards,
+                        parity_shards: ec_vol.parity_shards,
                         ..Default::default()
                     },
                 );

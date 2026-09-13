@@ -139,7 +139,7 @@ func CollectionDetails(data dash.CollectionDetailsData) templ.Component {
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 9, "</h4><small>Data stored (regular volumes only)</small></div><div class=\"align-self-center\"><i class=\"fas fa-hdd fa-2x\"></i></div></div></div></div></div></div><!-- Size Information Note --><div class=\"alert alert-info\" role=\"alert\"><i class=\"fas fa-info-circle me-2\"></i> <strong>Size Information:</strong> Logical size represents the actual data stored (regular volumes only).  EC volumes show shard counts instead of size - physical storage for EC volumes is approximately 1.4x the original data due to erasure coding redundancy.</div><!-- Pagination Info --><div class=\"d-flex justify-content-between align-items-center mb-3\"><div class=\"d-flex align-items-center\"><span class=\"me-3\">Showing ")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 9, "</h4><small>Live data, regular + EC volumes</small></div><div class=\"align-self-center\"><i class=\"fas fa-hdd fa-2x\"></i></div></div></div></div></div></div><!-- Size Information Note --><div class=\"alert alert-info\" role=\"alert\"><i class=\"fas fa-info-circle me-2\"></i> <strong>Size Information:</strong> Logical size counts the live data in regular and EC volumes once, excluding deleted bytes, replicated copies and erasure-coding parity. The physical disk footprint is larger: regular volumes keep every replica, and EC volumes add parity shards (about 1.4x the original data for 10+4).</div><!-- Pagination Info --><div class=\"d-flex justify-content-between align-items-center mb-3\"><div class=\"d-flex align-items-center\"><span class=\"me-3\">Showing ")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -378,9 +378,9 @@ func CollectionDetails(data dash.CollectionDetailsData) templ.Component {
 				return templ_7745c5c3_Err
 			}
 			var templ_7745c5c3_Var19 string
-			templ_7745c5c3_Var19, templ_7745c5c3_Err = templ.JoinStringErrs(fmt.Sprintf("%d/14", ecVolume.TotalShards))
+			templ_7745c5c3_Var19, templ_7745c5c3_Err = templ.JoinStringErrs(fmt.Sprintf("%d/%d", ecVolume.TotalShards, ecVolume.ExpectedShards))
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `view/app/collection_details.templ`, Line: 228, Col: 81}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `view/app/collection_details.templ`, Line: 228, Col: 106}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var19))
 			if templ_7745c5c3_Err != nil {

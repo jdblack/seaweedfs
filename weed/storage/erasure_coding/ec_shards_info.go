@@ -127,30 +127,28 @@ func EcShardsTotalSize(vi *master_pb.VolumeEcShardInformationMessage) int64 {
 }
 
 // EcShardsVolumeDataShards returns the number of data shards for the EC volume
-// described by vi. Open-source SeaweedFS always uses the fixed 10+4 layout, so
-// this returns DataShardsCount. It is defined as a per-volume accessor (rather
-// than referencing DataShardsCount directly at every call site) so callers such
-// as ec.check.replication stay correct when a build derives the ratio per volume instead
-// of from the global constant.
+// described by vi, resolved from the ratio the volume reports (recorded in its
+// .vif) and falling back to the build default when unset. Callers use this
+// per-volume accessor rather than DataShardsCount so a custom-ratio volume is
+// judged against its own layout.
 func EcShardsVolumeDataShards(vi *master_pb.VolumeEcShardInformationMessage) int {
-	return DataShardsCount
+	dataShards, _ := ecShardRatiosFromMessage(vi)
+	return dataShards
 }
 
 // EcShardsVolumeParityShards returns the number of parity shards for the EC
-// volume described by vi. As with EcShardsVolumeDataShards, open-source
-// SeaweedFS uses the fixed 10+4 layout, so this returns ParityShardsCount.
+// volume described by vi, falling back to the build default when unset.
 func EcShardsVolumeParityShards(vi *master_pb.VolumeEcShardInformationMessage) int {
-	return ParityShardsCount
+	_, parityShards := ecShardRatiosFromMessage(vi)
+	return parityShards
 }
 
 // EcShardsDataSize returns the sum of sizes for data shards only (parity
 // shards excluded). Data shards are those with id < dataShards; all higher
-// shard ids are treated as parity. Passing dataShards <= 0 falls back to
-// the upstream default of DataShardsCount (10), which is correct for the
-// fixed 10+4 layout. Forks with per-volume ratio metadata (e.g. the
-// data_shards field carried on an extended VolumeEcShardInformationMessage)
-// should pass the per-volume value so logical sizes remain accurate under
-// custom EC policies like 6+3 or 16+6.
+// shard ids are treated as parity. Pass the volume's own data-shard count
+// (EcShardsVolumeDataShards(vi)); passing <= 0 falls back to DataShardsCount,
+// which is correct only for the build-default layout. The per-volume value
+// keeps logical sizes accurate under custom policies like 3+2, 6+3 or 16+6.
 func EcShardsDataSize(vi *master_pb.VolumeEcShardInformationMessage, dataShards int) int64 {
 	if vi == nil {
 		return 0
@@ -364,7 +362,7 @@ func (si *ShardsInfo) Copy() *ShardsInfo {
 
 // DeleteParityShards removes parity shards (those with id >= dataShards) from
 // a ShardInfo. dataShards is the volume's data-shard count; passing <= 0 falls
-// back to DataShardsCount (the fixed 10+4 layout). The upper bound is
+// back to DataShardsCount (the build default layout). The upper bound is
 // MaxShardCount, not TotalShardsCount, so a custom ratio's high parity ids
 // (e.g. 16+6 reaches id 21) are cleared too; Delete no-ops on absent ids.
 func (si *ShardsInfo) DeleteParityShards(dataShards int) {

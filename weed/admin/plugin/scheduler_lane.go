@@ -84,6 +84,8 @@ var jobTypeLaneMap = map[string]SchedulerLane{
 	"volume_balance": LaneDefault,
 	"ec_balance":     LaneDefault,
 	"erasure_coding": LaneDefault,
+	"ec_bitrot_scan": LaneDefault,
+	"ec_vacuum":      LaneDefault,
 	"admin_script":   LaneDefault,
 
 	// Iceberg table maintenance

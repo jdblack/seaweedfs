@@ -14,7 +14,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/worker_pb"
-	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding/ecbalancer"
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 	"github.com/seaweedfs/seaweedfs/weed/util/wildcard"
@@ -106,7 +105,7 @@ func Detection(ctx context.Context, metrics []*types.VolumeHealthMetrics, cluste
 	var ecSnapshot *ecbalancer.Topology
 	var nodeAddresses map[string]string
 	if clusterInfo != nil && clusterInfo.ActiveTopology != nil {
-		ecSnapshot = ecbalancer.FromActiveTopology(clusterInfo.ActiveTopology, erasure_coding.DataShardsCount)
+		ecSnapshot = ecbalancer.FromActiveTopology(clusterInfo.ActiveTopology, ecConfig.ResolveDataShards())
 		nodeAddresses = buildNodeAddressMap(clusterInfo.ActiveTopology)
 	}
 
@@ -154,7 +153,7 @@ func Detection(ctx context.Context, metrics []*types.VolumeHealthMetrics, cluste
 		// EcIndexBits to handle a single info entry carrying multiple shards.
 		if clusterInfo.ActiveTopology != nil {
 			shardCount := countExistingEcShardsForVolume(clusterInfo.ActiveTopology, metric.VolumeID, metric.Collection)
-			totalShards := erasure_coding.DataShardsCount + erasure_coding.ParityShardsCount
+			totalShards := ecConfig.ResolveDataShards() + ecConfig.ResolveParityShards()
 			if shardCount >= totalShards {
 				glog.Warningf("EC Detection: Volume %d has all %d EC shards in topology; "+
 					"source replica on %s is orphaned (#9448).",
@@ -205,7 +204,7 @@ func Detection(ctx context.Context, metrics []*types.VolumeHealthMetrics, cluste
 		// Min-node safety gate: don't encode when the cluster has fewer nodes than
 		// this collection's parity shards — shards could not be spread to tolerate
 		// failures. Mirrors the shell ec.encode guard (node count < parity shards).
-		if clusterNodeCount > 0 && clusterNodeCount < erasure_coding.ParityShardsCount {
+		if clusterNodeCount > 0 && clusterNodeCount < ecConfig.ResolveParityShards() {
 			skippedTooFewNodes++
 			continue
 		}
@@ -244,8 +243,8 @@ func Detection(ctx context.Context, metrics []*types.VolumeHealthMetrics, cluste
 				}
 
 				glog.Infof("EC Detection: ActiveTopology available, planning destinations for volume %d", metric.VolumeID)
-				dataShards := erasure_coding.DataShardsCount
-				parityShards := erasure_coding.ParityShardsCount
+				dataShards := ecConfig.ResolveDataShards()
+				parityShards := ecConfig.ResolveParityShards()
 				multiPlan, shardsPerPlan, err := planECDestinations(ecSnapshot, nodeAddresses, metric, ecConfig, replicaPlacement, dataShards, parityShards)
 				if err != nil {
 					glog.V(2).Infof("Failed to plan EC destinations for volume %d: %v", metric.VolumeID, err)

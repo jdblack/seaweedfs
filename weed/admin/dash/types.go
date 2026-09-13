@@ -254,22 +254,27 @@ type EcShardWithInfo struct {
 	// EC specific fields
 	EcIndexBits   uint32 `json:"ec_index_bits"`  // Bitmap of which shards this server has
 	ShardCount    int    `json:"shard_count"`    // Number of shards this server has for this volume
-	IsComplete    bool   `json:"is_complete"`    // True if this volume has all 14 shards
+	DataShards    int    `json:"data_shards"`    // Data shards for this volume (recorded ratio, or the build default)
+	ParityShards  int    `json:"parity_shards"`  // Parity shards for this volume
+	IsComplete    bool   `json:"is_complete"`    // True if this volume has all of its shards
 	MissingShards []int  `json:"missing_shards"` // List of missing shard IDs
 }
 
 // EcVolumeDetailsData represents the data for the EC volume details page
 type EcVolumeDetailsData struct {
-	Username      string            `json:"username"`
-	VolumeID      uint32            `json:"volume_id"`
-	Collection    string            `json:"collection"`
-	Shards        []EcShardWithInfo `json:"shards"`
-	TotalShards   int               `json:"total_shards"`
-	IsComplete    bool              `json:"is_complete"`
-	MissingShards []int             `json:"missing_shards"`
-	DataCenters   []string          `json:"datacenters"`
-	Servers       []string          `json:"servers"`
-	LastUpdated   time.Time         `json:"last_updated"`
+	Username       string            `json:"username"`
+	VolumeID       uint32            `json:"volume_id"`
+	Collection     string            `json:"collection"`
+	Shards         []EcShardWithInfo `json:"shards"`
+	TotalShards    int               `json:"total_shards"`
+	DataShards     int               `json:"data_shards"`     // Data shards for this volume (recorded ratio, or the build default)
+	ParityShards   int               `json:"parity_shards"`   // Parity shards for this volume
+	ExpectedShards int               `json:"expected_shards"` // data+parity: the count a complete volume should present
+	IsComplete     bool              `json:"is_complete"`
+	MissingShards  []int             `json:"missing_shards"`
+	DataCenters    []string          `json:"datacenters"`
+	Servers        []string          `json:"servers"`
+	LastUpdated    time.Time         `json:"last_updated"`
 
 	// Sorting
 	SortBy    string `json:"sort_by"`
@@ -291,7 +296,7 @@ type CollectionInfo struct {
 	VolumeCount   int      `json:"volume_count"`
 	EcVolumeCount int      `json:"ec_volume_count"`
 	ChunkCount    int64    `json:"chunk_count"`
-	TotalSize     int64    `json:"total_size"`
+	TotalSize     int64    `json:"total_size"` // logical size: live bytes net of tombstones, replicated copies and EC parity
 	DiskTypes     []string `json:"disk_types"`
 }
 
@@ -554,6 +559,9 @@ type EcVolumeWithShards struct {
 	VolumeID       uint32         `json:"volume_id"`
 	Collection     string         `json:"collection"`
 	TotalShards    int            `json:"total_shards"`
+	DataShards     int            `json:"data_shards"`     // Data shards for this volume (recorded ratio, or the build default)
+	ParityShards   int            `json:"parity_shards"`   // Parity shards for this volume
+	ExpectedShards int            `json:"expected_shards"` // data+parity: the count a complete volume should present
 	IsComplete     bool           `json:"is_complete"`
 	MissingShards  []int          `json:"missing_shards"`
 	ShardLocations map[int]string `json:"shard_locations"` // shardId -> server

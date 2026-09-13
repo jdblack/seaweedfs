@@ -88,12 +88,12 @@ func (dn *DataNode) UpdateEcShards(actualShards []*erasure_coding.EcVolumeInfo) 
 
 	}
 
-	existingKeys := make(map[ecShardKey]struct{}, len(existingEcShards))
+	existingByKey := make(map[ecShardKey]*erasure_coding.EcVolumeInfo, len(existingEcShards))
 	for _, ev := range existingEcShards {
-		existingKeys[ecShardKey{vid: ev.VolumeId, diskId: types.DiskId(ev.DiskId)}] = struct{}{}
+		existingByKey[ecShardKey{vid: ev.VolumeId, diskId: types.DiskId(ev.DiskId)}] = ev
 	}
 	for key, ecShards := range actualByKey {
-		if _, found := existingKeys[key]; found {
+		if _, found := existingByKey[key]; found {
 			continue
 		}
 
@@ -105,7 +105,12 @@ func (dn *DataNode) UpdateEcShards(actualShards []*erasure_coding.EcVolumeInfo) 
 		})
 	}
 
-	if len(newShards) > 0 || len(deletedShards) > 0 {
+	// fork: the shard bitmap alone misses metadata-only changes (e.g. an
+	// ec.vacuum that remounts the same shard ids); see ecShardMetadataChanged
+	// in ec_shard_metadata_fork.go.
+	metadataChanged := ecShardMetadataChanged(existingByKey, actualByKey)
+
+	if len(newShards) > 0 || len(deletedShards) > 0 || metadataChanged {
 		// if changed, set to the new ec shard map
 		dn.doUpdateEcShardsLocked(actualByKey)
 	}

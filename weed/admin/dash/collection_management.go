@@ -11,12 +11,7 @@ import (
 
 // GetClusterCollections retrieves cluster collections data
 func (s *AdminServer) GetClusterCollections() (*ClusterCollectionsData, error) {
-	var collections []CollectionInfo
-	var totalVolumes int
-	var totalEcVolumes int
-	var totalChunks int64
-	var totalSize int64
-	collectionMap := make(map[string]*CollectionInfo)
+	var topologyInfo *master_pb.TopologyInfo
 
 	// Get actual collection information from volume data
 	err := s.WithMasterClient(func(client master_pb.SeaweedClient) error {
@@ -25,134 +20,7 @@ func (s *AdminServer) GetClusterCollections() (*ClusterCollectionsData, error) {
 			return err
 		}
 
-		if resp.TopologyInfo != nil {
-			for _, dc := range resp.TopologyInfo.DataCenterInfos {
-				for _, rack := range dc.RackInfos {
-					for _, node := range rack.DataNodeInfos {
-						for _, diskInfo := range node.DiskInfos {
-							// Process regular volumes
-							for _, volInfo := range diskInfo.VolumeInfos {
-								// Extract collection name from volume info
-								collectionName := volInfo.Collection
-								if collectionName == "" {
-									collectionName = "default" // Default collection for volumes without explicit collection
-								}
-
-								// Get disk type from volume info, default to hdd if empty
-								diskType := volInfo.DiskType
-								if diskType == "" {
-									diskType = "hdd"
-								}
-
-								// Get or create collection info
-								if collection, exists := collectionMap[collectionName]; exists {
-									collection.VolumeCount++
-									collection.TotalSize += int64(volInfo.Size)
-
-									// Update data center if this collection spans multiple DCs
-									if collection.DataCenter != dc.Id && collection.DataCenter != "multi" {
-										collection.DataCenter = "multi"
-									}
-
-									// Add disk type if not already present
-									diskTypeExists := false
-									for _, existingDiskType := range collection.DiskTypes {
-										if existingDiskType == diskType {
-											diskTypeExists = true
-											break
-										}
-									}
-									if !diskTypeExists {
-										collection.DiskTypes = append(collection.DiskTypes, diskType)
-									}
-
-									totalVolumes++
-									totalSize += int64(volInfo.Size)
-								} else {
-									newCollection := CollectionInfo{
-										Name:          collectionName,
-										DataCenter:    dc.Id,
-										VolumeCount:   1,
-										EcVolumeCount: 0,
-										TotalSize:     int64(volInfo.Size),
-										DiskTypes:     []string{diskType},
-									}
-									collectionMap[collectionName] = &newCollection
-									totalVolumes++
-									totalSize += int64(volInfo.Size)
-								}
-							}
-
-							// Process EC volumes
-							ecVolumeMap := make(map[uint32]bool) // Track unique EC volumes to avoid double counting
-							for _, ecShardInfo := range diskInfo.EcShardInfos {
-								// Extract collection name from EC shard info
-								collectionName := ecShardInfo.Collection
-								if collectionName == "" {
-									collectionName = "default" // Default collection for EC volumes without explicit collection
-								}
-
-								// Only count each EC volume once (not per shard)
-								if !ecVolumeMap[ecShardInfo.Id] {
-									ecVolumeMap[ecShardInfo.Id] = true
-
-									// Get disk type from disk info, default to hdd if empty
-									diskType := diskInfo.Type
-									if diskType == "" {
-										diskType = "hdd"
-									}
-
-									// Get or create collection info
-									if collection, exists := collectionMap[collectionName]; exists {
-										collection.EcVolumeCount++
-
-										// Update data center if this collection spans multiple DCs
-										if collection.DataCenter != dc.Id && collection.DataCenter != "multi" {
-											collection.DataCenter = "multi"
-										}
-
-										// Add disk type if not already present
-										diskTypeExists := false
-										for _, existingDiskType := range collection.DiskTypes {
-											if existingDiskType == diskType {
-												diskTypeExists = true
-												break
-											}
-										}
-										if !diskTypeExists {
-											collection.DiskTypes = append(collection.DiskTypes, diskType)
-										}
-
-										totalEcVolumes++
-									} else {
-										newCollection := CollectionInfo{
-											Name:          collectionName,
-											DataCenter:    dc.Id,
-											VolumeCount:   0,
-											EcVolumeCount: 1,
-											TotalSize:     0,
-											DiskTypes:     []string{diskType},
-										}
-										collectionMap[collectionName] = &newCollection
-										totalEcVolumes++
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-
-			// Chunk counts come from the shared collection aggregation, which
-			// nets out tombstones and counts a chunk once no matter how many
-			// volume replicas or EC shard holders report it.
-			for collectionName, stats := range collectCollectionStats(resp.TopologyInfo) {
-				if collection, exists := collectionMap[collectionName]; exists {
-					collection.ChunkCount = stats.FileCount
-					totalChunks += stats.FileCount
-				}
-			}
-		}
+		topologyInfo = resp.TopologyInfo
 
 		return nil
 	})
@@ -161,9 +29,17 @@ func (s *AdminServer) GetClusterCollections() (*ClusterCollectionsData, error) {
 		return nil, err
 	}
 
-	// Convert map to slice
-	for _, collection := range collectionMap {
-		collections = append(collections, *collection)
+	var collections []CollectionInfo
+	var totalVolumes, totalEcVolumes int
+	var totalChunks, totalSize int64
+	if topologyInfo != nil {
+		collectionMap, volumes, ecVolumes := collectCollectionInfo(topologyInfo)
+		totalVolumes, totalEcVolumes = volumes, ecVolumes
+		for _, collection := range collectionMap {
+			collections = append(collections, *collection)
+			totalChunks += collection.ChunkCount
+			totalSize += collection.TotalSize
+		}
 	}
 
 	// Sort collections alphabetically by name
@@ -225,7 +101,6 @@ func (s *AdminServer) GetCollectionDetails(collectionName string, page int, page
 	}
 
 	regularVolumes = regularVolumeData.Volumes
-	totalSize = regularVolumeData.TotalSize
 
 	// Chunk counts come from the shared collection aggregation, which nets out
 	// tombstones and counts a chunk once no matter how many volume replicas or
@@ -236,6 +111,11 @@ func (s *AdminServer) GetCollectionDetails(collectionName string, page int, page
 		return nil, err
 	}
 	totalChunks := stats[collectionName].FileCount
+	// The logical size spans regular and EC volumes, netting out tombstones,
+	// replicated copies and EC parity. GetClusterVolumes instead mixes raw
+	// per-replica regular sizes with raw EC shard bytes, which reads as a
+	// fraction of the collection once most of it has been erasure coded.
+	totalSize = stats[collectionName].LogicalSize
 
 	// Collect data centers and disk types from regular volumes
 	for _, vol := range regularVolumes {

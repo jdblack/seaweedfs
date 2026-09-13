@@ -106,10 +106,12 @@ func (erb *ecRebuilder) selectAndReserveRebuilder(collection string, volumeId ne
 	var bestNode *EcNode
 	var bestSlotsNeeded int
 	var maxAvailableSlots int
-	var minSlotsNeeded int = erasure_coding.TotalShardsCount // Start with maximum possible
+	dataShards, parityShards := erb.volumeShardRatio(volumeId)
+	totalShards := dataShards + parityShards
+	var minSlotsNeeded int = totalShards // Start with maximum possible
 	for _, node := range erb.ecNodes {
 		localShards := erb.countLocalShards(node, collection, volumeId)
-		slotsNeeded := erasure_coding.TotalShardsCount - localShards
+		slotsNeeded := totalShards - localShards
 		if slotsNeeded < 0 {
 			slotsNeeded = 0
 		}
@@ -165,12 +167,14 @@ func (erb *ecRebuilder) rebuildEcVolumes(collection string) {
 		if !erb.matchesVolumeId(vid) {
 			continue
 		}
+		dataShards, parityShards := erb.volumeShardRatio(vid)
+		totalShards := dataShards + parityShards
 		shardCount := locations.shardCount()
-		if shardCount == erasure_coding.TotalShardsCount {
+		if shardCount == totalShards {
 			continue
 		}
-		if shardCount < erasure_coding.DataShardsCount {
-			erb.write("ec volume %d is unrepairable with %d shards (need %d), skipping\n", vid, shardCount, erasure_coding.DataShardsCount)
+		if shardCount < dataShards {
+			erb.write("ec volume %d is unrepairable with %d shards (need %d), skipping\n", vid, shardCount, dataShards)
 			continue
 		}
 
@@ -329,8 +333,9 @@ func (erb *ecRebuilder) prepareDataToRecover(rebuilder *EcNode, collection strin
 		}
 	}
 
-	targetShardCount := erasure_coding.TotalShardsCount
-	for i := erasure_coding.TotalShardsCount; i < len(locations); i++ {
+	dataShards, parityShards := erb.volumeShardRatio(volumeId)
+	targetShardCount := dataShards + parityShards
+	for i := targetShardCount; i < len(locations); i++ {
 		if len(locations[i]) > 0 {
 			targetShardCount = i + 1
 		}
@@ -394,7 +399,7 @@ func (erb *ecRebuilder) prepareDataToRecover(rebuilder *EcNode, collection strin
 		copiedShardIds = append(copiedShardIds, shardId)
 	}
 
-	if len(localShardIds)+recoverableRemoteShards >= erasure_coding.DataShardsCount {
+	if len(localShardIds)+recoverableRemoteShards >= dataShards {
 		return copiedShardIds, localShardIds, nil
 	}
 

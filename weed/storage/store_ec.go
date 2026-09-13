@@ -294,15 +294,27 @@ func (s *Store) MountEcShards(collection string, vid needle.VolumeId, shardId er
 
 			si := erasure_coding.NewShardsInfo()
 			si.Set(erasure_coding.NewShardInfo(shardId, erasure_coding.ShardSize(ecVolume.ShardSize())))
+			// Carry the live needle/delete counts in the mount delta too. The
+			// mount message is what re-creates the master's shard entry after an
+			// unmount/remount (e.g. ec.vacuum redistributing the same shard ids),
+			// and the full EC heartbeat that also carries them is only applied
+			// when the shard bitmap changes — so without these fields the master's
+			// entry keeps FileCount/DeleteCount at 0 until an unrelated shard-set
+			// change happens to refresh it.
+			fileCount, deleteCount := ecVolume.FileAndDeleteCount()
 			s.NewEcShardsChan <- &master_pb.VolumeEcShardInformationMessage{
-				Id:          uint32(vid),
-				Collection:  collection,
-				EcIndexBits: uint32(si.Bitmap()),
-				ShardSizes:  si.SizesInt64(),
-				DiskType:    string(ecVolume.DiskType()),
-				ExpireAtSec: ecVolume.ExpireAtSec,
-				DiskId:      uint32(diskId),
-				EncodeTsNs:  ecVolume.EncodeTsNs,
+				Id:           uint32(vid),
+				Collection:   collection,
+				EcIndexBits:  uint32(si.Bitmap()),
+				ShardSizes:   si.SizesInt64(),
+				DiskType:     string(ecVolume.DiskType()),
+				ExpireAtSec:  ecVolume.ExpireAtSec,
+				DiskId:       uint32(diskId),
+				FileCount:    fileCount,
+				DeleteCount:  deleteCount,
+				EncodeTsNs:   ecVolume.EncodeTsNs,
+				DataShards:   uint32(ecVolume.ECDataShards()),
+				ParityShards: uint32(ecVolume.ECParityShards()),
 			}
 			return nil
 		}
@@ -695,7 +707,6 @@ func (s *Store) cachedLookupEcShardLocations(ecVolume *erasure_coding.EcVolume) 
 
 	// Use the volume's own EC ratio so a custom-ratio volume (e.g. 9+3) is judged
 	// complete/recoverable against its real data-shard count, not the build default.
-	// In OSS the ratio is always 10+4, so this is a no-op.
 	ecCtx := ecVolume.ECContext
 	if ecCtx == nil {
 		ecCtx = erasure_coding.NewDefaultECContext(ecVolume.Collection, ecVolume.VolumeId)
@@ -1014,7 +1025,7 @@ func (s *Store) recoverOneRemoteEcShardInterval(needleId types.NeedleId, ecVolum
 	// Reconstruct with the volume's OWN EC ratio (loaded from its .vif), not the
 	// build default, so a custom-ratio volume (e.g. 9+3) is decoded with the matrix
 	// that actually produced its shards -- decoding it as 10+4 would corrupt the
-	// recovered bytes. In OSS the ratio is always 10+4, so this is a no-op.
+	// recovered bytes.
 	ecCtx := ecVolume.ECContext
 	if ecCtx == nil {
 		ecCtx = erasure_coding.NewDefaultECContext(ecVolume.Collection, ecVolume.VolumeId)

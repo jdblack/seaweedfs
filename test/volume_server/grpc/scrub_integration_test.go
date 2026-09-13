@@ -499,3 +499,78 @@ func assertOnlyBrokenShard(t *testing.T, mode string, resp *volume_server_pb.Scr
 		t.Fatalf("%s reported broken shards %v, want only shard %d (details: %v)", mode, infos, shardID, resp.GetDetails())
 	}
 }
+
+// --- EC CHECKSUM (bitrot) scrub tests ---
+
+// TestScrubEcVolumeChecksumHealthy verifies the bitrot CHECKSUM scrub passes on
+// an untouched EC volume. Generate writes a generation-0 .ecsum sidecar, so the
+// scrub has a manifest to verify against.
+func TestScrubEcVolumeChecksumHealthy(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	clusterHarness := framework.StartVolumeCluster(t, matrix.P1())
+	conn, grpcClient := framework.DialVolumeServer(t, clusterHarness.VolumeGRPCAddress())
+	defer conn.Close()
+
+	const volumeID = uint32(220)
+	httpClient := framework.NewHTTPClient()
+	ecSetup(t, grpcClient, httpClient, clusterHarness.VolumeAdminURL(), volumeID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	resp, err := grpcClient.ScrubEcVolume(ctx, &volume_server_pb.ScrubEcVolumeRequest{
+		VolumeIds: []uint32{volumeID},
+		Mode:      volume_server_pb.VolumeScrubMode_CHECKSUM,
+	})
+	if err != nil {
+		t.Fatalf("ScrubEcVolume CHECKSUM on healthy volume failed: %v", err)
+	}
+	if resp.GetTotalVolumes() != 1 {
+		t.Fatalf("expected total_volumes=1, got %d", resp.GetTotalVolumes())
+	}
+	if len(resp.GetBrokenShardInfos()) != 0 {
+		t.Fatalf("expected no broken shards on a healthy volume, got %v: %v", resp.GetBrokenShardInfos(), resp.GetDetails())
+	}
+}
+
+// TestScrubEcVolumeChecksumCorruptShard plants shard corruption and verifies the
+// CHECKSUM scrub reports the broken shard. ChecksumScrub Reed-Solomon-arbitrates
+// so a genuine shard corruption (not a stale sidecar) is what is flagged.
+func TestScrubEcVolumeChecksumCorruptShard(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	clusterHarness := framework.StartVolumeCluster(t, matrix.P1())
+	conn, grpcClient := framework.DialVolumeServer(t, clusterHarness.VolumeGRPCAddress())
+	defer conn.Close()
+
+	const volumeID = uint32(221)
+	httpClient := framework.NewHTTPClient()
+	ecSetup(t, grpcClient, httpClient, clusterHarness.VolumeAdminURL(), volumeID)
+
+	// Corrupt shard 0 by truncating it.
+	framework.CorruptEcShardFile(t, clusterHarness.BaseDir(), volumeID, 0)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	resp, err := grpcClient.ScrubEcVolume(ctx, &volume_server_pb.ScrubEcVolumeRequest{
+		VolumeIds: []uint32{volumeID},
+		Mode:      volume_server_pb.VolumeScrubMode_CHECKSUM,
+	})
+	if err != nil {
+		t.Fatalf("ScrubEcVolume CHECKSUM on corrupt shard failed: %v", err)
+	}
+	if len(resp.GetBrokenShardInfos()) == 0 {
+		t.Fatalf("expected a broken shard after corruption (details: %v)", resp.GetDetails())
+	}
+	for _, si := range resp.GetBrokenShardInfos() {
+		if si.GetVolumeId() != volumeID {
+			t.Fatalf("broken shard info for unexpected volume %d, want %d", si.GetVolumeId(), volumeID)
+		}
+	}
+}

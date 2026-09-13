@@ -589,6 +589,11 @@ func (t *ErasureCodingTask) generateEcShardsLocally(localFiles map[string]string
 
 	// Generate EC shard files (.ec00 ~ .ec13)
 	ecCtx := erasure_coding.BackgroundECContext()
+	// Use the task's configured ratio; an unset ratio keeps the encoder default.
+	if t.dataShards > 0 && t.parityShards > 0 {
+		ecCtx.DataShards = int(t.dataShards)
+		ecCtx.ParityShards = int(t.parityShards)
+	}
 	ecBitrot, err := erasure_coding.WriteEcFiles(baseName, ecCtx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate EC shard files: %w", err)
@@ -655,8 +660,7 @@ func (t *ErasureCodingTask) generateEcShardsLocally(localFiles map[string]string
 
 	// Always stamp the encode identity into the .vif so the read guard stays on.
 	// The ratio is the resolved one from the encoder's protection, defaulting to
-	// the context this path encodes with (not t.dataShards, which this path does
-	// not pass to the encoder).
+	// the build default; the bitrot block below replaces it with the encoded layout.
 	vifFile := baseName + ".vif"
 	defaultCtx := erasure_coding.NewDefaultECContext("", 0)
 	// Use the admin-issued generation when present so the distributed .vif carries

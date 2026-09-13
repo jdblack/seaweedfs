@@ -14,10 +14,19 @@ WEED_BINARY := $(BUILD_DIR)/weed
 .PHONY: all
 all: build
 
-# Install templ if not present
+# fork: pin the templ CLI. The committed *_templ.go must stay reproducible:
+# regenerating with a different CLI rewrites those files and creates merge
+# conflicts with upstream. v0.3.1001 reproduces our committed output (verified on
+# cluster_ec_shards, cluster_ec_volumes and ec_volume_details; v0.3.1020, the
+# version in go.mod, rewrites them). templ warns this is older than go.mod; that
+# is deliberate. Bump only together with a targeted regeneration pass.
+TEMPL_VERSION ?= v0.3.1001
+
+# Install the pinned templ if a different version is on PATH
 .PHONY: install-templ
 install-templ:
-	@which templ > /dev/null || (echo "Installing templ..." && go install github.com/a-h/templ/cmd/templ@latest)
+	@templ version 2>/dev/null | grep -qx "$(TEMPL_VERSION)" \
+		|| (echo "Installing templ $(TEMPL_VERSION)..." && go install github.com/a-h/templ/cmd/templ@$(TEMPL_VERSION))
 
 # Generate templ files
 .PHONY: generate
@@ -164,6 +173,8 @@ $(WEED_BINARY): $(TEMPL_GO_FILES) $(GO_FILES)
 	@$(MAKE) build
 
 # Auto-generate templ files when .templ files change
+# fork: generate the single file from weed/admin rather than the whole tree from
+# the repo root, so the baked FileName paths stay view/app/... (see TEMPL_VERSION)
 %_templ.go: %.templ
 	@echo "Regenerating $@ from $<"
-	@cd $(BUILD_DIR) && templ generate
+	@cd $(ADMIN_DIR) && templ generate -f $<

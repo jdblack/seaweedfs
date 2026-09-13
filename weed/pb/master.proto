@@ -183,9 +183,21 @@ message VolumeEcShardInformationMessage {
   // group shards by encode generation. Numbered 14 (not 10) to skip the
   // enterprise fork's reserved 10-13.
   int64 encode_ts_ns = 14;
+  // Per-volume Reed-Solomon ratio recorded in the .vif EcShardConfig. 0 means
+  // "unset": the reader falls back to the build default
+  // (erasure_coding.DataShardsCount / erasure_coding.ParityShardsCount), so a
+  // volume encoded before the ratio was tracked stays backward compatible.
+  //
+  // 20/21 deliberately match the enterprise fork's own data_shards/parity_shards
+  // (confirmed against its compiled descriptor), so the ratio crosses between
+  // this build and an enterprise build and ecbalancer.VolumeShardRatio reads the
+  // same fields. Do NOT move these to 15-19: upstream OSS reserves 15-19 for
+  // itself, so a fork that rebases on upstream would collide there.
+  uint32 data_shards = 20;
+  uint32 parity_shards = 21;
   // fields 15-19 reserved for future upstream open-source additions.
-  // fields 20+ are owned by the enterprise fork (e.g. data_shards/parity_shards)
-  // and must not be used here without coordination.
+  // fields 22+ are owned by the enterprise fork (e.g. volume_class=22,
+  // pending_switch_id=23) and must not be used here without coordination.
 }
 
 message StorageBackend {

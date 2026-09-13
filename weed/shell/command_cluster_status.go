@@ -427,6 +427,10 @@ func (sp *ClusterStatusPrinter) printVolumeInfo() {
 func (sp *ClusterStatusPrinter) printStorageInfo() {
 	perVolumeSize := map[needle.VolumeId]uint64{}
 	perEcVolumeSize := map[needle.VolumeId]uint64{}
+	// Per-volume EC ratio, so a custom-ratio volume's physical shard bytes are
+	// normalized to the right logical size below.
+	ecDataShards := map[needle.VolumeId]int{}
+	ecTotalShards := map[needle.VolumeId]int{}
 	var rawVolumeSize, rawEcVolumeSize uint64
 
 	for _, dci := range sp.topology.DataCenterInfos {
@@ -446,15 +450,22 @@ func (sp *ClusterStatusPrinter) printStorageInfo() {
 						}
 						perEcVolumeSize[vid] += size
 						rawEcVolumeSize += size
+						ds := erasure_coding.EcShardsVolumeDataShards(eci)
+						ecDataShards[vid] = ds
+						ecTotalShards[vid] = ds + erasure_coding.EcShardsVolumeParityShards(eci)
 					}
 
 				}
 			}
 		}
 	}
-	// normalize EC logical volume sizes given shard settings
+	// normalize EC logical volume sizes given each volume's own shard settings
 	for vid := range perEcVolumeSize {
-		perEcVolumeSize[vid] = perEcVolumeSize[vid] * erasure_coding.DataShardsCount / erasure_coding.TotalShardsCount
+		total := ecTotalShards[vid]
+		if total <= 0 {
+			continue
+		}
+		perEcVolumeSize[vid] = perEcVolumeSize[vid] * uint64(ecDataShards[vid]) / uint64(total)
 	}
 
 	var volumeSize, ecVolumeSize uint64

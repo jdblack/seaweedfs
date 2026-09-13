@@ -201,7 +201,7 @@ func buildBalancerTopology(topoInfo *master_pb.TopologyInfo, config *Config, all
 						fullDiskTypes[diskType] = true
 					}
 
-					fs := int(diskInfo.MaxVolumeCount-diskInfo.VolumeCount)*erasure_coding.DataShardsCount - countEcShards(diskInfo.EcShardInfos)
+					fs := int(diskInfo.MaxVolumeCount-diskInfo.VolumeCount)*erasure_coding.ShardsPerVolumeSlot(diskInfo.EcShardInfos) - countEcShards(diskInfo.EcShardInfos)
 					if fs > 0 && !fullDiskTypes[diskType] {
 						freeSlots += fs
 					}
@@ -282,10 +282,10 @@ func buildBalancerTopology(topoInfo *master_pb.TopologyInfo, config *Config, all
 }
 
 // resolveECRatio returns the (dataShards, parityShards) for a collection from the
-// admin EC config snapshot when present, else the local default. This keeps the
-// enterprise-only custom-ratio plumbing out of the shared planner.
+// admin EC config snapshot when present, else the local default. It is the
+// collection-level fallback; per-volume ratios are resolved separately from each
+// shard's heartbeat (ecbalancer.VolumeShardRatio).
 func resolveECRatio(_ *types.ClusterInfo, _ string) (int, int) {
-	// Custom EC ratios are an enterprise feature; OSS uses the standard scheme.
 	return normalizeECShardCounts(0, 0)
 }
 

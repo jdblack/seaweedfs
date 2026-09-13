@@ -892,6 +892,8 @@ impl EcVolume {
             file_count,
             delete_count,
             encode_ts_ns: self.encode_ts_ns,
+            data_shards: self.data_shards,
+            parity_shards: self.parity_shards,
             ..Default::default()
         }]
     }

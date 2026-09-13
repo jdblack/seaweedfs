@@ -89,7 +89,7 @@ templ CollectionDetails(data dash.CollectionDetailsData) {
 						<div>
 							<h6 class="card-title">Total Size (Logical)</h6>
 							<h4 class="mb-0">{util.BytesToHumanReadable(uint64(data.TotalSize))}</h4>
-							<small>Data stored (regular volumes only)</small>
+							<small>Live data, regular + EC volumes</small>
 						</div>
 						<div class="align-self-center">
 							<i class="fas fa-hdd fa-2x"></i>
@@ -103,9 +103,9 @@ templ CollectionDetails(data dash.CollectionDetailsData) {
 	<!-- Size Information Note -->
 	<div class="alert alert-info" role="alert">
 		<i class="fas fa-info-circle me-2"></i>
-		<strong>Size Information:</strong> 
-		Logical size represents the actual data stored (regular volumes only). 
-		EC volumes show shard counts instead of size - physical storage for EC volumes is approximately 1.4x the original data due to erasure coding redundancy.
+		<strong>Size Information:</strong>
+		Logical size counts the live data in regular and EC volumes once, excluding deleted bytes, replicated copies and erasure-coding parity.
+		The physical disk footprint is larger: regular volumes keep every replica, and EC volumes add parity shards (about 1.4x the original data for 10+4).
 	</div>
 
 	<!-- Pagination Info -->
@@ -225,7 +225,7 @@ templ CollectionDetails(data dash.CollectionDetailsData) {
 							</span>
 						</td>
 						<td>
-							<span class="badge bg-primary">{fmt.Sprintf("%d/14", ecVolume.TotalShards)}</span>
+							<span class="badge bg-primary">{fmt.Sprintf("%d/%d", ecVolume.TotalShards, ecVolume.ExpectedShards)}</span>
 						</td>
 						<td>
 							<span class="text-muted">-</span>
