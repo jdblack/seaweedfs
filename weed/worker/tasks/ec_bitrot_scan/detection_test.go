@@ -112,22 +112,30 @@ func TestEnumerateEcVolumesCollectionFilter(t *testing.T) {
 	require.Equal(t, "keep", candidates[0].Collection)
 }
 
-func TestBuildProposalsPaging(t *testing.T) {
+func TestBuildProposalsWindow(t *testing.T) {
 	candidates := []ecVolumeCandidate{
 		{VolumeID: 1, Collection: "c", DiskType: "hdd"},
 		{VolumeID: 2, Collection: "c", DiskType: "hdd"},
 		{VolumeID: 3, Collection: "c", DiskType: "hdd"},
 	}
 
-	proposals, hasMore := buildProposals(candidates, 2)
+	proposals, hasMore := buildProposals(candidates, 2, 0)
 	require.True(t, hasMore)
 	require.Len(t, proposals, 2)
 	require.Equal(t, "ec_bitrot_scan:1:c:hdd", proposals[0].GetDedupeKey())
 	require.Equal(t, jobType, proposals[0].GetJobType())
 
-	all, hasMore := buildProposals(candidates, 0)
+	// A non-positive slice means the whole roster.
+	all, hasMore := buildProposals(candidates, 0, 0)
 	require.False(t, hasMore)
 	require.Len(t, all, 3)
+
+	// A window running off the end wraps to the front of the roster.
+	wrapped, hasMore := buildProposals(candidates, 2, 2)
+	require.True(t, hasMore)
+	require.Len(t, wrapped, 2)
+	require.Equal(t, "ec_bitrot_scan:3:c:hdd", wrapped[0].GetDedupeKey())
+	require.Equal(t, "ec_bitrot_scan:1:c:hdd", wrapped[1].GetDedupeKey())
 }
 
 func TestHoldersForVolume(t *testing.T) {
@@ -161,7 +169,7 @@ func TestShardRatioForVolume(t *testing.T) {
 	require.Equal(t, 3, parity)
 }
 
-func TestDetectSkipsWithinMinInterval(t *testing.T) {
+func TestDetectMinimumIntervalFloor(t *testing.T) {
 	topo := topologyWithNodes([]*master_pb.DataNodeInfo{
 		dataNode("n1", "127.0.0.1:1", 9001, map[string][]*master_pb.VolumeEcShardInformationMessage{
 			"hdd": {ecInfo(1, "c1", 10, 4)},
@@ -176,27 +184,61 @@ func TestDetectSkipsWithinMinInterval(t *testing.T) {
 		},
 	}
 
-	// Default cadence is 3 days: a run 10s ago is well within it => skip.
+	// The floor is off by default: a run 10s ago does not stop detection.
 	sender := &recordingDetectionSender{}
 	req := &plugin_pb.RunDetectionRequest{
 		JobType:           jobType,
 		LastSuccessfulRun: timestamppb.New(time.Now().Add(-10 * time.Second)),
-	}
-	require.NoError(t, h.Detect(context.Background(), req, sender))
-	require.NotNil(t, sender.complete)
-	require.True(t, sender.complete.GetSuccess())
-	require.Empty(t, sender.proposals.GetProposals())
-	require.Zero(t, fetchCalls, "topology must not be fetched when skipping")
-
-	// Older than the 3-day default => detection proceeds.
-	sender = &recordingDetectionSender{}
-	req = &plugin_pb.RunDetectionRequest{
-		JobType:           jobType,
-		LastSuccessfulRun: timestamppb.New(time.Now().Add(-4 * 24 * time.Hour)),
+		AdminRuntime:      &plugin_pb.AdminRuntimeConfig{DetectionIntervalMinutes: 240},
 	}
 	require.NoError(t, h.Detect(context.Background(), req, sender))
 	require.Len(t, sender.proposals.GetProposals(), 1)
 	require.Equal(t, 1, fetchCalls)
+
+	// A floor at or below the detection interval is honored.
+	sender = &recordingDetectionSender{}
+	req = &plugin_pb.RunDetectionRequest{
+		JobType:           jobType,
+		LastSuccessfulRun: timestamppb.New(time.Now().Add(-10 * time.Second)),
+		AdminRuntime:      &plugin_pb.AdminRuntimeConfig{DetectionIntervalMinutes: 240},
+		WorkerConfigValues: map[string]*plugin_pb.ConfigValue{
+			fieldMinIntervalMins: {Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: 60}},
+		},
+	}
+	require.NoError(t, h.Detect(context.Background(), req, sender))
+	require.Empty(t, sender.proposals.GetProposals())
+	require.Equal(t, 1, fetchCalls, "topology must not be fetched when the floor skips")
+
+	// A floor longer than the detection interval would stretch one sweep over
+	// several targets (the stored 4320 against a 4-hour tick), so it is ignored.
+	sender = &recordingDetectionSender{}
+	req = &plugin_pb.RunDetectionRequest{
+		JobType:           jobType,
+		LastSuccessfulRun: timestamppb.New(time.Now().Add(-10 * time.Second)),
+		AdminRuntime:      &plugin_pb.AdminRuntimeConfig{DetectionIntervalMinutes: 240},
+		WorkerConfigValues: map[string]*plugin_pb.ConfigValue{
+			fieldMinIntervalMins: {Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: 4320}},
+		},
+	}
+	require.NoError(t, h.Detect(context.Background(), req, sender))
+	require.Len(t, sender.proposals.GetProposals(), 1)
+	require.Equal(t, 2, fetchCalls)
+}
+
+func TestEffectiveFloorMinutes(t *testing.T) {
+	const sweep, tick = 10080, 240
+	// Unset / disabled.
+	require.Zero(t, effectiveFloorMinutes(&Config{MinIntervalMinutes: 0, ScanIntervalMinutes: sweep}, tick))
+	// At or below the detection interval: honored, it cannot stretch the pass.
+	require.Equal(t, 60, effectiveFloorMinutes(&Config{MinIntervalMinutes: 60, ScanIntervalMinutes: sweep}, tick))
+	require.Equal(t, 240, effectiveFloorMinutes(&Config{MinIntervalMinutes: 240, ScanIntervalMinutes: sweep}, tick))
+	// Longer than the detection interval: ignored, or the pass would span
+	// several sweep targets (4320 min of floor against a 240 min tick is 18x).
+	require.Zero(t, effectiveFloorMinutes(&Config{MinIntervalMinutes: 4320, ScanIntervalMinutes: sweep}, tick))
+	// Nothing to reason about: the floor is the only pacing control there is.
+	require.Equal(t, 4320, effectiveFloorMinutes(&Config{MinIntervalMinutes: 4320, ScanIntervalMinutes: 0}, tick))
+	require.Equal(t, 4320, effectiveFloorMinutes(&Config{MinIntervalMinutes: 4320, ScanIntervalMinutes: sweep}, 0))
+	require.Zero(t, effectiveFloorMinutes(nil, tick))
 }
 
 func TestDetectMinIntervalMinutesOverride(t *testing.T) {
@@ -211,7 +253,8 @@ func TestDetectMinIntervalMinutesOverride(t *testing.T) {
 		},
 	}
 
-	// Override the cadence to 1 minute; a run 2 minutes ago is now older.
+	// Floor of 1 minute, below the weekly sweep target: a run 2 minutes ago is
+	// outside it, so detection proceeds.
 	sender := &recordingDetectionSender{}
 	req := &plugin_pb.RunDetectionRequest{
 		JobType:           jobType,

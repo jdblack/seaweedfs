@@ -4,6 +4,14 @@
 // verification behind the "ec.scrub -mode checksum" shell command), including
 // cold parity shards that normal serving never reads.
 //
+// Every EC volume is a candidate, so detection walks the roster as a rotation:
+// each cycle proposes the next slice of volumes, wrapping to the front, and a
+// bookmark in the worker's working directory records where the last cycle
+// stopped. The slice size is derived from ScanIntervalMinutes and the admin's
+// detection interval (see scanSliceSize), so one full pass stays at the
+// configured length as the roster grows — a fixed batch size would stretch the
+// pass linearly with the fleet.
+//
 // With CheckIndex enabled (the default) it also runs the INDEX scrub,
 // validating the .ecx needle index. Index findings are reported separately and
 // never auto-repaired.
@@ -27,11 +35,24 @@ const (
 	// jobType is the canonical plugin job type string.
 	jobType = "ec_bitrot_scan"
 
-	// defaultMinIntervalMinutes is the default spacing between sweep runs (3
-	// days). Bitrot accrues over months, so a slow cadence is deliberate; this
-	// diverges from the enterprise default of 300 seconds, which (combined with
-	// 10-minute detection) amounts to near-continuous scanning.
-	defaultMinIntervalMinutes = 3 * 24 * 60 // 4320, i.e. 3 days
+	// defaultScanIntervalMinutes is the target time for one full pass over the
+	// EC volume roster: 7 days. Bitrot accrues over months, so a slow cadence is
+	// deliberate — the point of the sweep is to catch the rare silent
+	// corruption while parity can still rebuild it, not to re-read the fleet
+	// continuously.
+	//
+	// The per-cycle slice is derived from this and the admin's detection
+	// interval (see scanSliceSize), so the pass length stays put as the roster
+	// grows instead of stretching the way a fixed batch size would.
+	defaultScanIntervalMinutes = 7 * 24 * 60 // 10080, i.e. weekly
+
+	// defaultMinIntervalMinutes is the default value of the OPTIONAL floor on
+	// how often this job type may run. 0 disables it, which is the default: the
+	// cadence target above is what paces the sweep, and a floor layered on top
+	// of it only stretches one pass across several targets. It remains
+	// available for the degenerate case (a roster small enough that the derived
+	// slice cannot lengthen the pass).
+	defaultMinIntervalMinutes = 0
 
 	// defaultScanTimeoutSeconds bounds a single volume's holder-by-holder scrub.
 	defaultScanTimeoutSeconds = 1800
@@ -41,6 +62,7 @@ const (
 	fieldAutoRepair       = "auto_repair"
 	fieldCheckIndex       = "check_index"
 	fieldMinIntervalMins  = "min_interval_minutes"
+	fieldScanIntervalMins = "scan_interval_minutes"
 	fieldScanTimeoutSecs  = "scan_timeout_seconds"
 )
 
@@ -58,22 +80,52 @@ type Config struct {
 	// scrub mode) alongside the shard checksums. Index issues are reported,
 	// never auto-repaired.
 	CheckIndex bool
-	// MinIntervalMinutes skips detection when the last successful run is more
-	// recent than this many minutes.
+	// MinIntervalMinutes is an OPTIONAL floor on how often this job type may
+	// run: when > 0 and no longer than the admin's detection interval,
+	// detection is skipped when the last successful run is more recent than
+	// this. 0 disables it. A longer floor is ignored, because it would stretch
+	// one sweep over several detection intervals.
 	MinIntervalMinutes int
+	// ScanIntervalMinutes is the target time for one full pass over the
+	// roster. Detection derives its per-cycle slice from this and the admin's
+	// detection interval, so the pass length holds as the fleet grows.
+	ScanIntervalMinutes int
 	// ScanTimeoutSeconds bounds a single volume's scrub across its holders.
 	ScanTimeoutSeconds int
 }
 
 // NewDefaultConfig returns the defaults: read-only (no auto-repair), metadata
-// checks on, a 3-day scan interval, and a 1800s per-volume scan timeout.
+// checks on, a weekly full pass, no minimum-interval floor, and a 1800s
+// per-volume scan timeout.
 func NewDefaultConfig() *Config {
 	return &Config{
-		AutoRepair:         false,
-		CheckIndex:         true,
-		MinIntervalMinutes: defaultMinIntervalMinutes,
-		ScanTimeoutSeconds: defaultScanTimeoutSeconds,
+		AutoRepair:          false,
+		CheckIndex:          true,
+		MinIntervalMinutes:  defaultMinIntervalMinutes,
+		ScanIntervalMinutes: defaultScanIntervalMinutes,
+		ScanTimeoutSeconds:  defaultScanTimeoutSeconds,
 	}
+}
+
+// effectiveFloorMinutes returns the minimum-interval floor actually applied: 0
+// when the operator left it unset, or when applying it would break the sweep
+// target. A pass is ceil(sweep/tick) cycles, so a floor longer than the admin's
+// detection interval makes detection run less often than the pass assumes and
+// silently stretches it — the stored 4320 against a 4-hour tick would turn a
+// weekly pass into a 126-day one. The sweep target is the explicit pacing knob,
+// so such a floor is ignored and warned about rather than obeyed; a floor at or
+// below the tick cannot stretch anything, and is honored because it is then the
+// only thing keeping detection from running more often than intended.
+func effectiveFloorMinutes(cfg *Config, tickMinutes int) int {
+	if cfg == nil || cfg.MinIntervalMinutes <= 0 {
+		return 0
+	}
+	if cfg.ScanIntervalMinutes <= 0 || tickMinutes <= 0 || cfg.MinIntervalMinutes <= tickMinutes {
+		return cfg.MinIntervalMinutes
+	}
+	glog.Warningf("ec_bitrot_scan: min_interval_minutes=%d exceeds the %d-minute detection interval and is ignored; the %d-minute sweep target governs",
+		cfg.MinIntervalMinutes, tickMinutes, cfg.ScanIntervalMinutes)
+	return 0
 }
 
 // deriveConfig resolves a Config from the admin- and worker-side descriptor
@@ -90,6 +142,9 @@ func deriveConfig(adminValues, workerValues map[string]*plugin_pb.ConfigValue) *
 	// Worker-side cadence/timeout. A non-positive value falls back to the default.
 	if v := pluginworker.ReadIntConfig(workerValues, fieldMinIntervalMins, cfg.MinIntervalMinutes); v > 0 {
 		cfg.MinIntervalMinutes = v
+	}
+	if v := pluginworker.ReadIntConfig(workerValues, fieldScanIntervalMins, cfg.ScanIntervalMinutes); v > 0 {
+		cfg.ScanIntervalMinutes = v
 	}
 	if v := pluginworker.ReadIntConfig(workerValues, fieldScanTimeoutSecs, cfg.ScanTimeoutSeconds); v > 0 {
 		cfg.ScanTimeoutSeconds = v

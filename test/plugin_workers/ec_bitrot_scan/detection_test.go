@@ -46,7 +46,7 @@ func TestEcBitrotScanDetectsEcVolumes(t *testing.T) {
 	master := pluginworkers.NewMasterServer(t, response)
 
 	dialOption := grpc.WithTransportCredentials(insecure.NewCredentials())
-	handler := ec_bitrot_scan.NewBitrotScanHandler(dialOption)
+	handler := ec_bitrot_scan.NewBitrotScanHandler(dialOption, t.TempDir())
 	harness := pluginworkers.NewHarness(t, pluginworkers.HarnessConfig{
 		WorkerOptions: pluginworker.WorkerOptions{GrpcDialOption: dialOption},
 		Handlers:      []pluginworker.JobHandler{handler},

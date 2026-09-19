@@ -18,7 +18,7 @@ func init() {
 		Category: pluginworker.CategoryDefault,
 		Aliases:  []string{"ec-bitrot", "ec.bitrot", "ec_bitrot_scrub"},
 		Build: func(opts pluginworker.HandlerBuildOptions) (pluginworker.JobHandler, error) {
-			return NewBitrotScanHandler(opts.GrpcDialOption), nil
+			return NewBitrotScanHandler(opts.GrpcDialOption, opts.WorkingDir), nil
 		},
 	})
 }
@@ -27,15 +27,20 @@ func init() {
 type BitrotScanHandler struct {
 	grpcDialOption grpc.DialOption
 
+	// workingDir holds the rotation bookmark. Empty disables the cursor, which
+	// only means each cycle starts at the front of the roster.
+	workingDir string
+
 	// fetchTopology and repair are seams so unit tests can drive detection and
 	// repair without a live cluster.
 	fetchTopology func(ctx context.Context, masters []string) (*master_pb.TopologyInfo, error)
 	repair        repairer
 }
 
-func NewBitrotScanHandler(dialOpt grpc.DialOption) *BitrotScanHandler {
+func NewBitrotScanHandler(dialOpt grpc.DialOption, workingDir string) *BitrotScanHandler {
 	return &BitrotScanHandler{
 		grpcDialOption: dialOpt,
+		workingDir:     workingDir,
 		fetchTopology: func(ctx context.Context, masters []string) (*master_pb.TopologyInfo, error) {
 			topo, _, err := fetchTopologyFromMasters(ctx, masters, dialOpt)
 			return topo, err
@@ -163,9 +168,18 @@ func (h *BitrotScanHandler) Descriptor() *plugin_pb.JobTypeDescriptor {
 					Description: "Controls how frequently detection proposes new scans.",
 					Fields: []*plugin_pb.ConfigField{
 						{
+							Name:        fieldScanIntervalMins,
+							Label:       "Full Sweep Interval (minutes)",
+							Description: "Target time for one full pass over every EC volume (10080 = 7 days). Detection derives each cycle's batch size from this and the detection interval, so the pass stays on schedule as the fleet grows.",
+							FieldType:   plugin_pb.ConfigFieldType_CONFIG_FIELD_TYPE_INT64,
+							Widget:      plugin_pb.ConfigWidget_CONFIG_WIDGET_NUMBER,
+							Required:    true,
+							MinValue:    &plugin_pb.ConfigValue{Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: 1}},
+						},
+						{
 							Name:        fieldMinIntervalMins,
-							Label:       "Minimum Interval (minutes)",
-							Description: "Skip detection when the last successful run is more recent than this many minutes (4320 = 3 days).",
+							Label:       "Minimum Interval (minutes, optional)",
+							Description: "Optional floor on how often this job type may run: detection is skipped when the last successful run is more recent than this. Leave 0. A value longer than the detection interval is ignored, because it would stretch one sweep over several intervals.",
 							FieldType:   plugin_pb.ConfigFieldType_CONFIG_FIELD_TYPE_INT64,
 							Widget:      plugin_pb.ConfigWidget_CONFIG_WIDGET_NUMBER,
 							Required:    true,
@@ -184,8 +198,9 @@ func (h *BitrotScanHandler) Descriptor() *plugin_pb.JobTypeDescriptor {
 				},
 			},
 			DefaultValues: map[string]*plugin_pb.ConfigValue{
-				fieldMinIntervalMins: {Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: defaultMinIntervalMinutes}},
-				fieldScanTimeoutSecs: {Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: defaultScanTimeoutSeconds}},
+				fieldScanIntervalMins: {Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: defaultScanIntervalMinutes}},
+				fieldMinIntervalMins:  {Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: defaultMinIntervalMinutes}},
+				fieldScanTimeoutSecs:  {Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: defaultScanTimeoutSeconds}},
 			},
 		},
 		AdminRuntimeDefaults: &plugin_pb.AdminRuntimeDefaults{
@@ -201,15 +216,19 @@ func (h *BitrotScanHandler) Descriptor() *plugin_pb.JobTypeDescriptor {
 			ExecutionTimeoutSeconds:       1800,
 		},
 		WorkerDefaultValues: map[string]*plugin_pb.ConfigValue{
-			fieldMinIntervalMins: {Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: defaultMinIntervalMinutes}},
-			fieldScanTimeoutSecs: {Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: defaultScanTimeoutSeconds}},
+			fieldScanIntervalMins: {Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: defaultScanIntervalMinutes}},
+			fieldMinIntervalMins:  {Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: defaultMinIntervalMinutes}},
+			fieldScanTimeoutSecs:  {Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: defaultScanTimeoutSeconds}},
 		},
 	}
 }
 
-// Detect enumerates EC volumes from the master topology and proposes one scan
-// per distinct (volume_id, collection, disk_type). It skips detection entirely
-// when the last successful run is more recent than the minimum interval.
+// Detect walks the EC volume roster as a rotation: it resumes at the bookmark
+// written by the previous cycle, proposes the next slice of volumes (one scan
+// per distinct (volume_id, collection, disk_type), wrapping to the front of the
+// roster), and advances the bookmark past what it proposed. The slice is
+// derived from the configured sweep interval and the admin's detection
+// interval, so one full pass keeps its length as the roster grows.
 func (h *BitrotScanHandler) Detect(ctx context.Context, request *plugin_pb.RunDetectionRequest, sender pluginworker.DetectionSender) error {
 	if request == nil {
 		return fmt.Errorf("run detection request is nil")
@@ -223,13 +242,19 @@ func (h *BitrotScanHandler) Detect(ctx context.Context, request *plugin_pb.RunDe
 
 	cfg := deriveConfig(request.GetAdminConfigValues(), request.GetWorkerConfigValues())
 
-	// Min-interval gate: skip when the last successful run is too recent.
-	if last := request.GetLastSuccessfulRun(); last != nil && cfg.MinIntervalMinutes > 0 {
-		if since := time.Since(last.AsTime()); since >= 0 && since < time.Duration(cfg.MinIntervalMinutes)*time.Minute {
-			_ = sender.SendActivity(pluginworker.BuildDetectorActivity("skipped",
-				fmt.Sprintf("last successful run %s ago is within the %d-minute minimum interval; skipping", since.Round(time.Minute), cfg.MinIntervalMinutes), nil))
-			return sender.SendComplete(&plugin_pb.DetectionComplete{JobType: jobType, Success: true, TotalProposals: 0})
-		}
+	// The admin's detection interval is both the sweep clock and the yardstick
+	// for whether a configured floor would stretch it.
+	tickMinutes := int(request.GetAdminRuntime().GetDetectionIntervalMinutes())
+
+	// Optional floor on how often this job type may run. The sweep interval,
+	// not this, is what paces the rotation; effectiveFloorMinutes drops a floor
+	// that would stretch the pass.
+	if floor := effectiveFloorMinutes(cfg, tickMinutes); floor > 0 &&
+		pluginworker.ShouldSkipDetectionByInterval(request.GetLastSuccessfulRun(), floor*60) {
+		since := time.Since(request.GetLastSuccessfulRun().AsTime())
+		_ = sender.SendActivity(pluginworker.BuildDetectorActivity("skipped",
+			fmt.Sprintf("last successful run %s ago is within the %d-minute minimum interval; skipping", since.Round(time.Minute), floor), nil))
+		return sender.SendComplete(&plugin_pb.DetectionComplete{JobType: jobType, Success: true, TotalProposals: 0})
 	}
 
 	masters := masterAddresses(request.GetClusterContext())
@@ -250,13 +275,25 @@ func (h *BitrotScanHandler) Detect(ctx context.Context, request *plugin_pb.RunDe
 	if maxResults < 0 {
 		maxResults = 0
 	}
-	proposals, hasMore := buildProposals(candidates, maxResults)
+	slice, cycles := scanSliceSize(len(candidates), cfg.ScanIntervalMinutes, tickMinutes, maxResults)
+	start := bookmarkPosition(candidates, readBookmark(h.workingDir))
+	proposals, hasMore := buildProposals(candidates, slice, start)
+	h.advanceBookmark(candidates, start, slice)
 
-	summary := fmt.Sprintf("EC bitrot scan detection: %d candidate volume(s)", len(proposals))
+	glog.V(1).Infof("ec_bitrot_scan: roster=%d slice=%d cycles_per_pass=%d start_index=%d tick=%dm sweep_interval=%dm",
+		len(candidates), slice, cycles, start, tickMinutes, cfg.ScanIntervalMinutes)
+
+	summary := fmt.Sprintf("EC bitrot scan detection: proposing %d of %d volume(s)", len(proposals), len(candidates))
 	if hasMore {
-		summary += " (more available)"
+		summary += fmt.Sprintf(" (slice %d per cycle; full pass %d cycle(s))", slice, cycles)
 	}
-	if err := sender.SendActivity(pluginworker.BuildDetectorActivity("decision_summary", summary, nil)); err != nil {
+	details := map[string]*plugin_pb.ConfigValue{
+		"roster_size":     {Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: int64(len(candidates))}},
+		"slice":           {Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: int64(slice)}},
+		"cycles_per_pass": {Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: int64(cycles)}},
+		"sweep_start":     {Kind: &plugin_pb.ConfigValue_StringValue{StringValue: sweepStartKey(candidates, start)}},
+	}
+	if err := sender.SendActivity(pluginworker.BuildDetectorActivity("decision_summary", summary, details)); err != nil {
 		glog.V(1).Infof("ec_bitrot_scan: failed to emit detection trace: %v", err)
 	}
 
@@ -273,6 +310,39 @@ func (h *BitrotScanHandler) Detect(ctx context.Context, request *plugin_pb.RunDe
 		Success:        true,
 		TotalProposals: int32(len(proposals)),
 	})
+}
+
+// advanceBookmark records the volume this cycle stopped at, so the next cycle
+// resumes after it. Best-effort by design: a failed write costs one restart of
+// the rotation, never a skipped volume.
+func (h *BitrotScanHandler) advanceBookmark(candidates []ecVolumeCandidate, start, slice int) {
+	if len(candidates) == 0 || slice <= 0 {
+		return
+	}
+	taken := slice
+	if taken > len(candidates) {
+		taken = len(candidates)
+	}
+	if start < 0 || start >= len(candidates) {
+		start = 0
+	}
+	last := candidates[(start+taken-1)%len(candidates)]
+	writeBookmark(h.workingDir, &scanBookmark{
+		VolumeID:   last.VolumeID,
+		Collection: last.Collection,
+		DiskType:   last.DiskType,
+	})
+}
+
+// sweepStartKey names the volume a cycle starts at, for the detector trace. An
+// operator can compare it against the previous cycle's to see the rotation
+// moving, or against a volume that looks stale to see whether it has been
+// reached yet.
+func sweepStartKey(candidates []ecVolumeCandidate, start int) string {
+	if len(candidates) == 0 || start < 0 || start >= len(candidates) {
+		return ""
+	}
+	return candidates[start].dedupeKey()
 }
 
 // masterAddresses extracts the master gRPC addresses from a detection/execution
