@@ -9,12 +9,12 @@
 #   1. The Go binary arrives pre-built: deploy_image.sh cross-compiles it with the
 #      same settings upstream's builder stage uses (-tags "$TAGS", CGO_ENABLED=0,
 #      -ldflags "-s -w -extldflags -static -X .../version.COMMIT=<short sha>").
-#   2. The two Rust binaries are taken pre-built or not at all. There is no cargo
-#      fallback for weed-volume because no Rust toolchain is available here and
-#      seaweed-worker/ pins rust-version 1.94.1. Upstream treats the worker that
-#      way itself ("taken pre-built or not at all"); a missing file becomes the
-#      same zero-byte placeholder its rust_builder writes, which the chart's
-#      lance container refuses to exec.
+#   2. The two Rust binaries are built from THIS tree (deploy_image.sh RUST_BUILD=1, or
+#      a RUST_BIN_DIR you built), never lifted from an upstream image: weed-volume has
+#      to carry this fork's master.proto fields (data_shards/parity_shards) or it
+#      reports no per-volume EC ratio. Absent, they become the same zero-byte
+#      placeholders upstream's rust_builder writes, which the chart's lance container
+#      refuses to exec.
 #
 # Everything else is verbatim: the alpine final stage, its apk line (libgcc /
 # libcrypto3 / libssl3 are what the Rust binaries link), the seaweed user,
