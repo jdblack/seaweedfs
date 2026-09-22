@@ -27,11 +27,20 @@
 #                           (_large_disk) and selects the matching Rust source image,
 #                           because OffsetSize 4 vs 5 is an on-disk format: never
 #                           mix variants inside one cluster.
-#   UPSTREAM_TAG=4.47       upstream release whose image carries the Rust binaries
+#   WITH_RUST=0             DEFAULT. /usr/bin/weed-volume and /usr/bin/weed-worker stay
+#                           the zero-byte placeholders upstream's builder writes, and
+#                           nothing is pulled from upstream. Safe because nothing here
+#                           execs them: the Rust volume server is opt-in and test-only,
+#                           and a chart >= 4.45 lance sidecar is kept out with
+#                           s3.lancePort=0 (worker.namespaceUrl must stay empty too).
+#   WITH_RUST=1             stage real Rust binaries lifted from RUST_SOURCE_IMAGE, which
+#                           is UPSTREAM's build, not this tree's. Its weed-volume predates
+#                           this fork's master.proto fields (data_shards/parity_shards) and
+#                           therefore reports no per-volume EC ratio, so enable this only
+#                           when the lance worker is actually wanted.
+#   UPSTREAM_TAG=4.47       upstream release whose image carries those binaries
 #   RUST_SOURCE_IMAGE=...   image to copy /usr/bin/weed-{volume,worker} from
 #                           (default: chrislusf/seaweedfs:${UPSTREAM_TAG}${SUFFIX})
-#   WITH_RUST=1             stage those binaries; 0 leaves the empty placeholders,
-#                           which is what a chart >= 4.45 lance sidecar refuses to exec
 #   SOURCE_URL=...          OCI source label      (default: the `mine` remote)
 #   SKIP_SMOKE=1            skip the post-build container checks
 set -euo pipefail
@@ -47,7 +56,7 @@ IMAGE="${IMAGE:-jblack-seaweedfs}"
 PLATFORM="${PLATFORM:-linux/amd64}"
 TAGS="${TAGS:-}"
 UPSTREAM_TAG="${UPSTREAM_TAG:-4.47}"
-WITH_RUST="${WITH_RUST:-1}"
+WITH_RUST="${WITH_RUST:-0}"
 SKIP_SMOKE="${SKIP_SMOKE:-0}"
 
 DO_PUSH=1
@@ -138,7 +147,11 @@ done
 echo "==> image:      $REF:${IMAGE_TAGS[0]}"
 echo "    platform:   $PLATFORM ($ARCH)"
 echo "    variant:    TAGS=${TAGS:-<none>}  suffix=${SUFFIX:-<none>}"
-echo "    rust:       WITH_RUST=$WITH_RUST  source=${RUST_SRC}"
+if [[ "$WITH_RUST" -eq 1 ]]; then
+  echo "    rust:       WITH_RUST=1  source=${RUST_SRC}  (UPSTREAM binaries, not this tree)"
+else
+  echo "    rust:       WITH_RUST=0  placeholders; nothing pulled from upstream"
+fi
 echo
 
 # ---------------------------------------------------------------------------
@@ -167,6 +180,9 @@ mkdir -p "$(dirname "$WORKER_DEST")" "$(dirname "$VOLUME_DEST")"
 
 if [[ "$WITH_RUST" -eq 1 ]]; then
   echo ">> [2/5] staging /usr/bin/weed-worker and /usr/bin/weed-volume from ${RUST_SRC}"
+  echo "    WARNING: these are UPSTREAM's binaries, not built from this tree ($RUST_SRC)."
+  echo "    WARNING: upstream's weed-volume predates our master.proto fields"
+  echo "             (data_shards/parity_shards), so it reports no per-volume EC ratio."
   "$RUNTIME" pull --platform "$PLATFORM" "$RUST_SRC" >/dev/null
   TMP_CONTAINER="seaweedfs-rust-src-$$"
   cleanup_container() { "$RUNTIME" rm -f "$TMP_CONTAINER" >/dev/null 2>&1 || true; }
