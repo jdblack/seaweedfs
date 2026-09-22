@@ -18,8 +18,9 @@ import (
 // rather than an index: the roster changes between cycles as volumes are
 // created, deleted, and re-encoded, and a positional index would then point at
 // a different volume. Losing the file is safe — a pod recreation wipes the
-// working directory and the next cycle starts at the front of the roster,
-// which costs one uneven pass and never skips a volume.
+// working directory, and the next cycle starts at a random point in the roster
+// (coldStartIndex) so that repeated cold starts spread over it instead of all
+// converging on its head. Either way no volume is skipped.
 const bookmarkFileName = "ec_bitrot_scan.bookmark"
 
 // scanBookmark identifies the volume a rotation cycle last proposed.
@@ -31,7 +32,8 @@ type scanBookmark struct {
 
 // readBookmark loads the rotation cursor. A missing cursor is the ordinary
 // first-cycle state; an unreadable or malformed one is a real (if cosmetic)
-// problem, so it warns. Either way the caller starts at the front.
+// problem, so it warns. Either way the caller has no cursor, so the cycle
+// starts at a random point in the roster.
 func readBookmark(workingDir string) *scanBookmark {
 	if workingDir == "" {
 		return nil
@@ -39,7 +41,7 @@ func readBookmark(workingDir string) *scanBookmark {
 	data, err := os.ReadFile(filepath.Join(workingDir, bookmarkFileName))
 	if err != nil {
 		if os.IsNotExist(err) {
-			glog.V(1).Infof("ec_bitrot_scan: no bookmark at %s, starting this sweep at the front of the roster", workingDir)
+			glog.V(1).Infof("ec_bitrot_scan: no bookmark at %s; this cycle starts at a random point in the roster", workingDir)
 		} else {
 			glog.Warningf("ec_bitrot_scan: read bookmark: %v", err)
 		}

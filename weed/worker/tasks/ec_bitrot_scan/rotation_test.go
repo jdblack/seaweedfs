@@ -109,3 +109,109 @@ func TestDetectRotatesThroughTheRoster(t *testing.T) {
 	}
 	require.Len(t, seen, volumes, "consecutive cycles must cover the whole roster")
 }
+
+// TestColdStartUsesARandomPoint pins the cold-start contract: with no bookmark
+// on disk the cycle starts at the index the picker returns, and the bookmark it
+// writes carries the rotation on from there rather than restarting at the head.
+func TestColdStartUsesARandomPoint(t *testing.T) {
+	const volumes = 5
+	ecInfos := make([]*master_pb.VolumeEcShardInformationMessage, 0, volumes)
+	for i := 1; i <= volumes; i++ {
+		ecInfos = append(ecInfos, ecInfo(uint32(i), "c1", 10, 4))
+	}
+	picks := 0
+	h := &BitrotScanHandler{
+		workingDir: t.TempDir(),
+		fetchTopology: func(ctx context.Context, masters []string) (*master_pb.TopologyInfo, error) {
+			return topologyWithNodes([]*master_pb.DataNodeInfo{
+				dataNode("n1", "127.0.0.1:1", 9001, map[string][]*master_pb.VolumeEcShardInformationMessage{"hdd": ecInfos}),
+			}), nil
+		},
+		randIntn: func(n int) int {
+			picks++
+			require.Equal(t, volumes, n)
+			return 3
+		},
+	}
+
+	// Weekly target at a 4-hour tick => ceil(5/42) = 1 volume per cycle.
+	req := &plugin_pb.RunDetectionRequest{
+		JobType:      jobType,
+		MaxResults:   1,
+		AdminRuntime: &plugin_pb.AdminRuntimeConfig{DetectionIntervalMinutes: 240},
+	}
+
+	first := &recordingDetectionSender{}
+	require.NoError(t, h.Detect(context.Background(), req, first))
+	require.Len(t, first.proposals.GetProposals(), 1)
+	// Index 3 of a 1..5 roster is volume 4.
+	require.Equal(t, int64(4), first.proposals.GetProposals()[0].GetParameters()["volume_id"].GetInt64Value())
+	require.Equal(t, "ec_bitrot_scan:4:c1:hdd", first.proposals.GetProposals()[0].GetDedupeKey())
+	require.Equal(t, 1, picks)
+
+	// The next cycle resumes after the cold start, not at the head.
+	second := &recordingDetectionSender{}
+	require.NoError(t, h.Detect(context.Background(), req, second))
+	require.Len(t, second.proposals.GetProposals(), 1)
+	require.Equal(t, int64(5), second.proposals.GetProposals()[0].GetParameters()["volume_id"].GetInt64Value())
+	require.Equal(t, 1, picks, "a cycle with a cursor must not consult the picker")
+}
+
+// TestColdStartIndexStaysInRange guards the picker: an empty roster has nowhere
+// to start, and otherwise the index must address a candidate.
+func TestColdStartIndexStaysInRange(t *testing.T) {
+	h := &BitrotScanHandler{}
+	require.Zero(t, h.coldStartIndex(0))
+	for _, size := range []int{1, 2, 7, 100} {
+		seen := map[int]struct{}{}
+		for i := 0; i < 200; i++ {
+			idx := h.coldStartIndex(size)
+			require.GreaterOrEqual(t, idx, 0)
+			require.Less(t, idx, size)
+			seen[idx] = struct{}{}
+		}
+		// Not a distribution test, but a picker that never moves would not
+		// spread cold starts at all.
+		if size > 1 {
+			require.Greater(t, len(seen), 1, "size %d never moved off one index", size)
+		}
+	}
+}
+
+// TestRotationCoversEveryVolumeFromAnyColdStart extends the coverage invariant
+// to the cold start: wherever a cursorless cycle begins, a full pass still
+// reaches every volume.
+func TestRotationCoversEveryVolumeFromAnyColdStart(t *testing.T) {
+	const volumes = 7
+	ecInfos := make([]*master_pb.VolumeEcShardInformationMessage, 0, volumes)
+	for i := 1; i <= volumes; i++ {
+		ecInfos = append(ecInfos, ecInfo(uint32(i), "c1", 10, 4))
+	}
+	topo := topologyWithNodes([]*master_pb.DataNodeInfo{
+		dataNode("n1", "127.0.0.1:1", 9001, map[string][]*master_pb.VolumeEcShardInformationMessage{"hdd": ecInfos}),
+	})
+	req := &plugin_pb.RunDetectionRequest{
+		JobType:      jobType,
+		MaxResults:   1,
+		AdminRuntime: &plugin_pb.AdminRuntimeConfig{DetectionIntervalMinutes: 240},
+	}
+
+	for coldStart := 0; coldStart < volumes; coldStart++ {
+		h := &BitrotScanHandler{
+			workingDir: t.TempDir(),
+			fetchTopology: func(ctx context.Context, masters []string) (*master_pb.TopologyInfo, error) {
+				return topo, nil
+			},
+			randIntn: func(int) int { return coldStart },
+		}
+
+		seen := map[int64]bool{}
+		for cycle := 0; cycle < volumes; cycle++ {
+			sender := &recordingDetectionSender{}
+			require.NoError(t, h.Detect(context.Background(), req, sender))
+			require.Len(t, sender.proposals.GetProposals(), 1, "cold start %d, cycle %d", coldStart, cycle)
+			seen[sender.proposals.GetProposals()[0].GetParameters()["volume_id"].GetInt64Value()] = true
+		}
+		require.Len(t, seen, volumes, "a full pass from cold start %d must reach every volume", coldStart)
+	}
+}

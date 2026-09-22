@@ -3,6 +3,7 @@ package ec_bitrot_scan
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -27,14 +28,18 @@ func init() {
 type BitrotScanHandler struct {
 	grpcDialOption grpc.DialOption
 
-	// workingDir holds the rotation bookmark. Empty disables the cursor, which
-	// only means each cycle starts at the front of the roster.
+	// workingDir holds the rotation bookmark. Empty disables the cursor: every
+	// cycle then starts at a random point in the roster.
 	workingDir string
 
 	// fetchTopology and repair are seams so unit tests can drive detection and
 	// repair without a live cluster.
 	fetchTopology func(ctx context.Context, masters []string) (*master_pb.TopologyInfo, error)
 	repair        repairer
+
+	// randIntn picks the starting index for a cycle that has no cursor. A seam
+	// so tests can pin the cold start; nil falls back to math/rand.
+	randIntn func(n int) int
 }
 
 func NewBitrotScanHandler(dialOpt grpc.DialOption, workingDir string) *BitrotScanHandler {
@@ -276,7 +281,17 @@ func (h *BitrotScanHandler) Detect(ctx context.Context, request *plugin_pb.RunDe
 		maxResults = 0
 	}
 	slice, cycles := scanSliceSize(len(candidates), cfg.ScanIntervalMinutes, tickMinutes, maxResults)
-	start := bookmarkPosition(candidates, readBookmark(h.workingDir))
+
+	// A cycle with no cursor starts at a random point in the roster rather than
+	// at its head. A fresh detector — a recreated pod whose working directory
+	// was wiped, or an admin restart that moved the detector lease to another
+	// worker — would otherwise walk the same first volumes every time, deferring
+	// the rest of the roster by a full pass on each restart.
+	bm := readBookmark(h.workingDir)
+	start := bookmarkPosition(candidates, bm)
+	if bm == nil {
+		start = h.coldStartIndex(len(candidates))
+	}
 	proposals, hasMore := buildProposals(candidates, slice, start)
 	h.advanceBookmark(candidates, start, slice)
 
@@ -310,6 +325,19 @@ func (h *BitrotScanHandler) Detect(ctx context.Context, request *plugin_pb.RunDe
 		Success:        true,
 		TotalProposals: int32(len(proposals)),
 	})
+}
+
+// coldStartIndex returns where a cycle with no cursor begins. Random, so that
+// repeated cold starts spread across the roster instead of converging on its
+// head; the rotation still walks the deterministic roster order from there.
+func (h *BitrotScanHandler) coldStartIndex(rosterSize int) int {
+	if rosterSize <= 0 {
+		return 0
+	}
+	if h.randIntn != nil {
+		return h.randIntn(rosterSize)
+	}
+	return rand.Intn(rosterSize)
 }
 
 // advanceBookmark records the volume this cycle stopped at, so the next cycle
