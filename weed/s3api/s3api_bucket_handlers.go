@@ -8,7 +8,6 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"sort"
@@ -1130,12 +1129,10 @@ func (s3a *S3ApiServer) PutBucketLifecycleConfigurationHandler(w http.ResponseWr
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, maxBucketLifecycleConfigurationSize)
-	lifecycleXML, err := io.ReadAll(r.Body)
+	lifecycleXML, err := readRequestBody(r, maxBucketLifecycleConfigurationSize)
 	if err != nil {
 		glog.Warningf("PutBucketLifecycleConfigurationHandler read body: %s", err)
-		var maxBytesErr *http.MaxBytesError
-		if errors.As(err, &maxBytesErr) {
+		if errors.Is(err, errRequestBodyTooLarge) {
 			s3err.WriteErrorResponse(w, r, s3err.ErrEntityTooLarge)
 			return
 		}
@@ -1253,6 +1250,11 @@ func (s3a *S3ApiServer) DeleteBucketLifecycleHandler(w http.ResponseWriter, r *h
 // https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketLocation.html
 func (s3a *S3ApiServer) GetBucketLocationHandler(w http.ResponseWriter, r *http.Request) {
 	bucket, _ := s3_constants.GetBucketAndObject(r)
+
+	if err := s3bucket.VerifyS3BucketName(bucket); err != nil {
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidBucketName)
+		return
+	}
 
 	if err := s3a.checkBucket(r, bucket); err != s3err.ErrNone {
 		s3err.WriteErrorResponse(w, r, err)

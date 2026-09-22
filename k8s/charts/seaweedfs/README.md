@@ -286,7 +286,7 @@ metadata:
     app.kubernetes.io/component: s3
 stringData:
   # this key must be an inline json config file
-  seaweedfs_s3_config: '{"identities":[{"name":"anvAdmin","credentials":[{"accessKey":"snu8yoP6QAlY0ne4","secretKey":"PNzBcmeLNEdR0oviwm04NQAicOrDH1Km"}],"actions":["Admin","Read","Write"]},{"name":"anvReadOnly","credentials":[{"accessKey":"SCigFee6c5lbi04A","secretKey":"kgFhbT38R8WUYVtiFQ1OiSVOrYr3NKku"}],"actions":["Read"]}]}'
+  seaweedfs_s3_config: '{"identities":[{"name":"anvAdmin","credentials":[{"accessKey":"snu8yoP6QAlY0ne4","secretKey":"PNzBcmeLNEdR0oviwm04NQAicOrDH1Km"}],"actions":["Admin","Read","Write"]},{"name":"anvReadOnly","credentials":[{"accessKey":"SCigFee6c5lbi04A","secretKey":"kgFhbT38R8WUYVtiFQ1OiSVOrYr3NKku"}],"actions":["Read","List"]}]}'
 ```
 
 #### Source S3 credentials from an existing Secret
@@ -376,7 +376,10 @@ start on a non-loopback address without `-adminPassword`, so the chart fails at
 render time if `admin.ip` is non-loopback and authentication is not configured via
 `admin.secret.adminPassword`, `admin.secret.existingSecret`, or
 `WEED_ADMIN_PASSWORD` supplied through `admin.extraEnvironmentVars` /
-`admin.secretExtraEnvironmentVars`. The whole `127.0.0.0/8` range and `::1` are
+`admin.secretExtraEnvironmentVars`. Setting `admin.allowInsecureBind` renders
+`-allowInsecureBind` and bypasses this guard; it leaves the admin API
+unauthenticated on the network, so use it only when access is otherwise
+restricted (e.g. network policies). The whole `127.0.0.0/8` range and `::1` are
 treated as loopback (matching `weed admin`); `localhost` is treated as
 non-loopback. Set `admin.ip` to a loopback address only if you also replace the
 httpGet probes (e.g. with an `exec` probe that checks `127.0.0.1`).

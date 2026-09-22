@@ -4,23 +4,27 @@
 //! 48 RPCs: core volume operations are fully implemented, streaming and
 //! EC operations are stubbed with appropriate error messages.
 
+use std::ops::ControlFlow;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::pb::filer_pb;
 use crate::pb::master_pb;
-use crate::pb::master_pb::seaweed_client::SeaweedClient;
 use crate::pb::volume_server_pb;
 use crate::pb::volume_server_pb::volume_server_server::VolumeServer;
-use crate::storage::erasure_coding::ec_shard::DATA_SHARDS_COUNT;
+use crate::storage::erasure_coding::ec_shard::{DATA_SHARDS_COUNT, ShardId, shard_id_try_from};
 use crate::storage::needle::needle::{self, Needle};
 use crate::storage::types::*;
+use crate::storage::volume::VolumeSpec;
 
-use super::grpc_client::{build_grpc_endpoint, GRPC_MAX_MESSAGE_SIZE};
+use super::grpc_client::{
+    GrpcDialOptions, connect_channel, connect_channel_guarded, filer_client, master_client,
+    volume_server_client,
+};
 use super::volume_server::VolumeServerState;
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -263,6 +267,18 @@ pub struct VolumeGrpcService {
 }
 
 impl VolumeGrpcService {
+    fn store_read(&self) -> std::sync::RwLockReadGuard<'_, crate::storage::store::Store> {
+        self.state.store.read().unwrap_or_else(|e| {
+            tracing::warn!("recovering poisoned store read lock");
+            e.into_inner()
+        })
+    }
+    fn store_write(&self) -> std::sync::RwLockWriteGuard<'_, crate::storage::store::Store> {
+        self.state.store.write().unwrap_or_else(|e| {
+            tracing::warn!("recovering poisoned store write lock");
+            e.into_inner()
+        })
+    }
     /// Verifies the gRPC caller is allowed to invoke a destructive admin
     /// operation. Mirrors the Go side's checkGrpcAdminAuth: an empty
     /// whitelist accepts everyone (insecure-by-default for tests and
@@ -323,20 +339,14 @@ impl VolumeGrpcService {
         let grpc_addr = parse_grpc_address(&master_url).map_err(|e| {
             Status::internal(format!("invalid master address {}: {}", master_url, e))
         })?;
-        let endpoint = build_grpc_endpoint(&grpc_addr, self.state.outgoing_grpc_tls.as_ref())
-            .map_err(|e| Status::internal(format!("master address {}: {}", master_url, e)))?
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(30));
-        let channel = endpoint
-            .connect()
-            .await
-            .map_err(|e| Status::internal(format!("connect to master {}: {}", master_url, e)))?;
-        let mut client = SeaweedClient::with_interceptor(
-            channel,
-            super::request_id::outgoing_request_id_interceptor,
+        let channel = connect_channel(
+            &grpc_addr,
+            self.state.outgoing_grpc_tls.as_ref(),
+            GrpcDialOptions::long(),
         )
-        .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE)
-        .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE);
+        .await
+        .map_err(|e| Status::internal(format!("connect to master {}: {}", master_url, e)))?;
+        let mut client = master_client(channel);
         client
             .volume_mark_readonly(master_pb::VolumeMarkReadonlyRequest {
                 ip: info.ip.clone(),
@@ -896,8 +906,11 @@ impl VolumeServer for VolumeGrpcService {
                 store.has_ec_volume(file_id.volume_id)
             };
 
-            // Cookie validation (unless skip_cookie_check)
-            if !req.skip_cookie_check {
+            // Cookie validation (unless skip_cookie_check). EC volumes always
+            // take this branch: the distributed read is the only source of the
+            // on-disk cookie and size, and Go's DeleteEcShardNeedle compares
+            // the fid cookie against it even when the caller asked to skip.
+            if !req.skip_cookie_check || is_ec_volume {
                 let original_cookie = n.cookie;
                 if !is_ec_volume {
                     let store = self.state.store.read().unwrap();
@@ -915,48 +928,43 @@ impl VolumeServer for VolumeGrpcService {
                         }
                     }
                 } else {
-                    // For EC volumes, verify needle exists in ecx index
-                    let store = self.state.store.read().unwrap();
-                    if let Some(ec_vol) = store.find_ec_volume(file_id.volume_id) {
-                        match ec_vol.find_needle_from_ecx(n.id) {
-                            Ok(Some((_, size))) if !size.is_deleted() => {
-                                // Needle exists and is not deleted — cookie check not possible
-                                // for EC volumes without distributed read, so we accept it
-                                n.data_size = size.0 as u32;
-                            }
-                            Ok(_) => {
-                                results.push(volume_server_pb::DeleteResult {
-                                    file_id: fid_str.clone(),
-                                    status: 404,
-                                    error: format!("ec needle {} not found", fid_str),
-                                    size: 0,
-                                    version: 0,
-                                });
-                                continue;
-                            }
-                            Err(e) => {
-                                results.push(volume_server_pb::DeleteResult {
-                                    file_id: fid_str.clone(),
-                                    status: 404,
-                                    error: e.to_string(),
-                                    size: 0,
-                                    version: 0,
-                                });
-                                continue;
-                            }
+                    // Go's ReadEcShardNeedle fills the needle — the local .ecx
+                    // alone can't supply the cookie or the manifest flag.
+                    match crate::server::store_ec::read_ec_shard_needle_distributed(
+                        &self.state,
+                        file_id.volume_id,
+                        n.id,
+                    )
+                    .await
+                    {
+                        Ok(Some(ec_needle)) => n = ec_needle,
+                        Ok(None) => {
+                            results.push(volume_server_pb::DeleteResult {
+                                file_id: fid_str.clone(),
+                                status: 404,
+                                error: format!("ec needle {} not found", fid_str),
+                                size: 0,
+                                version: 0,
+                            });
+                            continue;
                         }
-                    } else {
-                        results.push(volume_server_pb::DeleteResult {
-                            file_id: fid_str.clone(),
-                            status: 404,
-                            error: format!("ec volume {} not found", file_id.volume_id),
-                            size: 0,
-                            version: 0,
-                        });
-                        continue;
+                        Err(e) => {
+                            results.push(volume_server_pb::DeleteResult {
+                                file_id: fid_str.clone(),
+                                status: 404,
+                                error: e.to_string(),
+                                size: 0,
+                                version: 0,
+                            });
+                            continue;
+                        }
                     }
                 }
-                if n.cookie != original_cookie {
+                // Go's inner check is `cookie != 0 && cookie != n.Cookie`: a
+                // zero fid cookie skips validation, which can only happen
+                // here when skip_cookie_check was already requested.
+                if (!req.skip_cookie_check || original_cookie.0 != 0) && n.cookie != original_cookie
+                {
                     results.push(volume_server_pb::DeleteResult {
                         file_id: fid_str.clone(),
                         status: 400,
@@ -1058,37 +1066,50 @@ impl VolumeServer for VolumeGrpcService {
                     }
                 }
             } else {
-                // EC volume deletion: journal the delete locally (with cookie validation, matching Go)
-                let mut store = self.state.store.write().unwrap();
-                if let Some(ec_vol) = store.find_ec_volume_mut(file_id.volume_id) {
-                    match ec_vol.journal_delete_with_cookie(n.id, n.cookie) {
-                        Ok(()) => {
-                            results.push(volume_server_pb::DeleteResult {
-                                file_id: fid_str.clone(),
-                                status: 202,
-                                error: String::new(),
-                                size: n.data_size,
-                                version: 0,
-                            });
-                        }
-                        Err(e) => {
-                            results.push(volume_server_pb::DeleteResult {
-                                file_id: fid_str.clone(),
-                                status: 500,
-                                error: e.to_string(),
-                                size: 0,
-                                version: 0,
-                            });
-                        }
+                // EC volume deletion: forward the tombstone to a holder of the
+                // needle's primary shard (Go's DeleteEcShardNeedle →
+                // VolumeEcBlobDelete). The cookie was already validated
+                // against the distributed read above.
+                match crate::server::store_ec::delete_ec_shard_needle_distributed(
+                    &self.state,
+                    file_id.volume_id,
+                    n.id,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        results.push(volume_server_pb::DeleteResult {
+                            file_id: fid_str.clone(),
+                            status: 202,
+                            error: String::new(),
+                            size: n.data_size,
+                            version: 0,
+                        });
                     }
-                } else {
-                    results.push(volume_server_pb::DeleteResult {
-                        file_id: fid_str.clone(),
-                        status: 404,
-                        error: format!("ec volume {} not found", file_id.volume_id),
-                        size: 0,
-                        version: 0,
-                    });
+                    Err(e) => {
+                        // Needle vanished while the volume stays mounted:
+                        // Go's ErrorDeleted → NotModified. The volume itself
+                        // unmounting means no journal anywhere, so 500 (Go's
+                        // generic error path) lets the caller retry.
+                        let already_gone = e.kind() == std::io::ErrorKind::NotFound
+                            && self
+                                .state
+                                .store
+                                .read()
+                                .unwrap()
+                                .has_ec_volume(file_id.volume_id);
+                        results.push(volume_server_pb::DeleteResult {
+                            file_id: fid_str.clone(),
+                            status: if already_gone { 304 } else { 500 },
+                            error: if already_gone {
+                                String::new()
+                            } else {
+                                e.to_string()
+                            },
+                            size: 0,
+                            version: 0,
+                        });
+                    }
                 }
             }
         }
@@ -1106,7 +1127,9 @@ impl VolumeServer for VolumeGrpcService {
         let store = self.state.store.read().unwrap();
         let garbage_ratio = match store.find_volume(vid) {
             Some((_, vol)) => vol.garbage_level(),
-            None => return Err(Status::not_found(format!("not found volume id {}", vid))),
+            None => {
+                return Err(crate::storage::volume::VolumeError::VolumeNotFound(vid).into());
+            }
         };
         Ok(Response::new(volume_server_pb::VacuumVolumeCheckResponse {
             garbage_ratio,
@@ -1164,7 +1187,10 @@ impl VolumeServer for VolumeGrpcService {
                 .inc();
 
             if let Err(e) = result {
-                let _ = tx.blocking_send(Err(Status::internal(e)));
+                let _ = tx.blocking_send(Err(crate::server::status_with_context(
+                    &format!("compact volume {vid}"),
+                    e,
+                )));
             }
         });
 
@@ -1206,7 +1232,10 @@ impl VolumeServer for VolumeGrpcService {
                     volume_size,
                 },
             )),
-            Err(e) => Err(Status::internal(e)),
+            Err(e) => Err(crate::server::status_with_context(
+                &format!("commit compact volume {vid}"),
+                e,
+            )),
         }
     }
 
@@ -1222,7 +1251,10 @@ impl VolumeServer for VolumeGrpcService {
             Ok(()) => Ok(Response::new(
                 volume_server_pb::VacuumVolumeCleanupResponse {},
             )),
-            Err(e) => Err(Status::internal(e)),
+            Err(e) => Err(crate::server::status_with_context(
+                &format!("cleanup volume {vid}"),
+                e,
+            )),
         }
     }
 
@@ -1234,9 +1266,9 @@ impl VolumeServer for VolumeGrpcService {
         let collection = &request.into_inner().collection;
         {
             let mut store = self.state.store.write().unwrap();
-            store
-                .delete_collection(collection)
-                .map_err(|e| Status::internal(e))?;
+            store.delete_collection(collection).map_err(|e| {
+                crate::server::status_with_context(&format!("delete collection {collection}"), e)
+            })?;
         }
         // The delta the notify path derives is the only thing that tells the
         // master these slots came free: a heartbeat carries the whole list only
@@ -1261,7 +1293,7 @@ impl VolumeServer for VolumeGrpcService {
         } else {
             Some(
                 crate::storage::needle::ttl::TTL::read(&req.ttl)
-                    .map_err(|e| Status::invalid_argument(e))?,
+                    .map_err(Status::invalid_argument)?,
             )
         };
         let disk_type = DiskType::from_string(&req.disk_type);
@@ -1276,12 +1308,14 @@ impl VolumeServer for VolumeGrpcService {
         store
             .add_volume(
                 vid,
-                &req.collection,
-                Some(rp),
-                ttl,
-                req.preallocate as u64,
                 disk_type,
-                version,
+                &VolumeSpec {
+                    collection: &req.collection,
+                    replica_placement: Some(rp),
+                    ttl,
+                    preallocate: req.preallocate as u64,
+                    version,
+                },
             )
             .map_err(|e| Status::internal(e.to_string()))?;
         self.state.volume_state_notify.notify_one();
@@ -1388,14 +1422,14 @@ impl VolumeServer for VolumeGrpcService {
             Local(std::fs::File),
             Remote(crate::storage::volume::RemoteDatFile),
         }
-        let reader = if v.has_remote_file {
+        let reader = if v.has_remote_file() {
             match v.remote_dat_file() {
                 Some(r) => DatReader::Remote(r),
                 None => {
                     return Err(Status::not_found(format!(
                         "remote dat not loaded for volume id {}",
                         vid
-                    )))
+                    )));
                 }
             }
         } else {
@@ -1539,24 +1573,16 @@ impl VolumeServer for VolumeGrpcService {
         let vid = VolumeId(req.volume_id);
         let mut store = self.state.store.write().unwrap();
         if req.only_empty {
-            let (_, vol) = store
-                .find_volume(vid)
-                .ok_or_else(|| Status::not_found(format!("not found volume id {}", vid)))?;
+            let (_, vol) = store.find_volume(vid).ok_or_else(|| {
+                Status::from(crate::storage::volume::VolumeError::VolumeNotFound(vid))
+            })?;
             if vol.file_count() > 0 {
-                return Err(Status::failed_precondition("volume not empty"));
+                return Err(Status::from(crate::storage::volume::VolumeError::NotEmpty));
             }
         }
         store
             .delete_volume(vid, req.only_empty, req.keep_remote_data)
-            .map_err(|e| match e {
-                crate::storage::volume::VolumeError::NotFound => {
-                    Status::not_found(format!("not found volume id {}", vid))
-                }
-                crate::storage::volume::VolumeError::NotEmpty => {
-                    Status::failed_precondition("volume not empty")
-                }
-                other => Status::internal(other.to_string()),
-            })?;
+            .map_err(|e| crate::server::status_with_context(&format!("delete volume {vid}"), e))?;
         self.state.volume_state_notify.notify_one();
         Ok(Response::new(volume_server_pb::VolumeDeleteResponse {}))
     }
@@ -1790,6 +1816,17 @@ impl VolumeServer for VolumeGrpcService {
         let req = request.into_inner();
         let vid = VolumeId(req.volume_id);
 
+        if !self.state.allow_untrusted_remote_endpoints {
+            crate::remote_storage::validate_replica_target(&req.source_data_node)
+                .await
+                .map_err(|e| {
+                    Status::invalid_argument(format!(
+                        "invalid source data node {}: {}",
+                        req.source_data_node, e
+                    ))
+                })?;
+        }
+
         // A pre-existing local replica is NOT deleted up front. Deleting before
         // the source is confirmed reachable destroys a healthy copy on a
         // transient source outage (and, on retry, can lose the volume
@@ -1809,26 +1846,22 @@ impl VolumeServer for VolumeGrpcService {
             ))
         })?;
 
-        let channel = build_grpc_endpoint(&grpc_addr, self.state.outgoing_grpc_tls.as_ref())
-            .map_err(|e| {
-                Status::internal(format!("VolumeCopy volume {} parse source: {}", vid, e))
-            })?
-            .connect()
-            .await
-            .map_err(|e| {
-                Status::internal(format!(
-                    "VolumeCopy volume {} connect to {}: {}",
-                    vid, grpc_addr, e
-                ))
-            })?;
+        let channel = connect_channel_guarded(
+            &grpc_addr,
+            source,
+            self.state.outgoing_grpc_tls.as_ref(),
+            GrpcDialOptions::stream(),
+            self.state.allow_untrusted_remote_endpoints,
+        )
+        .await
+        .map_err(|e| {
+            Status::internal(format!(
+                "VolumeCopy volume {} connect to {}: {}",
+                vid, grpc_addr, e
+            ))
+        })?;
 
-        let mut client =
-            volume_server_pb::volume_server_client::VolumeServerClient::with_interceptor(
-                channel,
-                super::request_id::outgoing_request_id_interceptor,
-            )
-            .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE)
-            .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE);
+        let mut client = volume_server_client(channel);
 
         // Get file status from source
         let vol_info = client
@@ -1978,24 +2011,29 @@ impl VolumeServer for VolumeGrpcService {
                 }
 
                 // Copy .dat file
+                let mut progress = CopyProgress {
+                    tx: &tx,
+                    next_report_target: &mut next_report_target,
+                    report_interval,
+                    throttler: &mut throttler,
+                };
                 if !has_remote_dat {
                     let dat_path = format!("{}.dat", data_base_name);
                     let dat_modified_ts_ns = copy_file_from_source(
                         &mut client,
-                        false,
-                        &req.collection,
-                        req.volume_id,
-                        vol_info.compaction_revision,
-                        vol_info.dat_file_size,
-                        &dat_path,
-                        ".dat",
-                        false,
-                        true,
-                        &tx,
-                        true,
-                        &mut next_report_target,
-                        report_interval,
-                        &mut throttler,
+                        &CopyFileSpec {
+                            is_ec_volume: false,
+                            collection: &req.collection,
+                            volume_id: req.volume_id,
+                            compaction_revision: vol_info.compaction_revision,
+                            stop_offset: vol_info.dat_file_size,
+                            dest_path: &dat_path,
+                            ext: ".dat",
+                            is_append: false,
+                            ignore_source_not_found: true,
+                            report_progress: true,
+                        },
+                        &mut progress,
                     )
                     .await?;
                     if dat_modified_ts_ns > 0 {
@@ -2007,20 +2045,19 @@ impl VolumeServer for VolumeGrpcService {
                 let idx_path = format!("{}.idx", idx_base_name);
                 let idx_modified_ts_ns = copy_file_from_source(
                     &mut client,
-                    false,
-                    &req.collection,
-                    req.volume_id,
-                    vol_info.compaction_revision,
-                    vol_info.idx_file_size,
-                    &idx_path,
-                    ".idx",
-                    false,
-                    false,
-                    &tx,
-                    false,
-                    &mut next_report_target,
-                    report_interval,
-                    &mut throttler,
+                    &CopyFileSpec {
+                        is_ec_volume: false,
+                        collection: &req.collection,
+                        volume_id: req.volume_id,
+                        compaction_revision: vol_info.compaction_revision,
+                        stop_offset: vol_info.idx_file_size,
+                        dest_path: &idx_path,
+                        ext: ".idx",
+                        is_append: false,
+                        ignore_source_not_found: false,
+                        report_progress: false,
+                    },
+                    &mut progress,
                 )
                 .await?;
                 if idx_modified_ts_ns > 0 {
@@ -2031,20 +2068,19 @@ impl VolumeServer for VolumeGrpcService {
                 let vif_path = format!("{}.vif", data_base_name);
                 let vif_modified_ts_ns = copy_file_from_source(
                     &mut client,
-                    false,
-                    &req.collection,
-                    req.volume_id,
-                    vol_info.compaction_revision,
-                    1024 * 1024,
-                    &vif_path,
-                    ".vif",
-                    false,
-                    true,
-                    &tx,
-                    false,
-                    &mut next_report_target,
-                    report_interval,
-                    &mut throttler,
+                    &CopyFileSpec {
+                        is_ec_volume: false,
+                        collection: &req.collection,
+                        volume_id: req.volume_id,
+                        compaction_revision: vol_info.compaction_revision,
+                        stop_offset: 1024 * 1024,
+                        dest_path: &vif_path,
+                        ext: ".vif",
+                        is_append: false,
+                        ignore_source_not_found: true,
+                        report_progress: false,
+                    },
+                    &mut progress,
                 )
                 .await?;
                 if vif_modified_ts_ns > 0 {
@@ -2053,13 +2089,13 @@ impl VolumeServer for VolumeGrpcService {
 
                 // Remove the .note file. A leftover note fails the load on the
                 // next restart, so a removal failure must fail the copy.
-                if let Err(e) = std::fs::remove_file(&note_path) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        return Err(Status::internal(format!(
-                            "remove .note for volume {}: {}",
-                            vid, e
-                        )));
-                    }
+                if let Err(e) = std::fs::remove_file(&note_path)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    return Err(Status::internal(format!(
+                        "remove .note for volume {}: {}",
+                        vid, e
+                    )));
                 }
 
                 // Verify file sizes
@@ -2115,7 +2151,7 @@ impl VolumeServer for VolumeGrpcService {
                 // unmounts and deletes the replica it just created.
                 if tx
                     .send(Ok(volume_server_pb::VolumeCopyResponse {
-                        last_append_at_ns: last_append_at_ns,
+                        last_append_at_ns,
                         processed_bytes: 0,
                     }))
                     .await
@@ -2200,7 +2236,7 @@ impl VolumeServer for VolumeGrpcService {
                 compaction_revision: vol.super_block.compaction_revision as u32,
                 collection: vol.collection.clone(),
                 disk_type: store.locations[loc_idx].disk_type.to_string(),
-                volume_info: Some(vol.volume_info.clone()),
+                volume_info: Some(vol.volume_info().clone()),
                 version: vol.version().0 as u32,
             },
         ))
@@ -2379,8 +2415,13 @@ impl VolumeServer for VolumeGrpcService {
     ) -> Result<Response<volume_server_pb::ReceiveFileResponse>, Status> {
         self.state.check_maintenance()?;
 
+        use tokio::io::AsyncWriteExt;
+
         let mut stream = request.into_inner();
-        let mut target_file: Option<std::fs::File> = None;
+        // tokio::fs + BufWriter, as `drain_copy_stream_to_file` below already
+        // does: the chunk writes and the final fsync are disk I/O and must not
+        // run on the runtime worker that is also driving this stream.
+        let mut target_file: Option<tokio::io::BufWriter<tokio::fs::File>> = None;
         let mut file_path: Option<String> = None;
         let mut bytes_written: u64 = 0;
         let mut resp_error: Option<String> = None;
@@ -2518,16 +2559,19 @@ impl VolumeServer for VolumeGrpcService {
                             }
                         };
 
-                        target_file = Some(std::fs::File::create(&path).map_err(|e| {
+                        let f = tokio::fs::File::create(&path).await.map_err(|e| {
                             Status::internal(format!("failed to create file: {}", e))
-                        })?);
+                        })?;
+                        target_file = Some(tokio::io::BufWriter::new(f));
                         file_path = Some(path);
                     }
                     Some(volume_server_pb::receive_file_request::Data::FileContent(content)) => {
                         if let Some(ref mut f) = target_file {
-                            use std::io::Write;
-                            match f.write(&content) {
-                                Ok(n) => bytes_written += n as u64,
+                            // write_all, not write: a short write (ENOSPC, NFS)
+                            // would be counted as success for however many
+                            // bytes landed, silently shifting later chunks.
+                            match f.write_all(&content).await {
+                                Ok(()) => bytes_written += content.len() as u64,
                                 Err(e) => {
                                     // Match Go: write failures are response-level errors, not gRPC errors
                                     resp_error = Some(format!("failed to write file: {}", e));
@@ -2552,15 +2596,31 @@ impl VolumeServer for VolumeGrpcService {
 
         match result {
             Ok(()) => {
-                // Check for protocol-level errors (returned in response body, not gRPC status)
+                // Flush the BufWriter and fsync, reporting failure through the
+                // response `error` field: the caller renames the staged file
+                // into place on success, so a swallowed fsync error would
+                // publish data that never reached disk.
+                if resp_error.is_none()
+                    && let Some(ref mut f) = target_file
+                {
+                    if let Err(e) = f.flush().await {
+                        resp_error = Some(format!("failed to flush file: {}", e));
+                    } else if let Err(e) = f.get_ref().sync_all().await {
+                        resp_error = Some(format!("failed to sync file: {}", e));
+                    }
+                }
+                // Protocol-level errors are returned in the response body, not
+                // gRPC status. Any of them leaves a partial staged file behind;
+                // remove it as Go does on a failed write.
                 if let Some(err_msg) = resp_error {
+                    drop(target_file.take());
+                    if let Some(ref p) = file_path {
+                        let _ = tokio::fs::remove_file(p).await;
+                    }
                     return Ok(Response::new(volume_server_pb::ReceiveFileResponse {
                         error: err_msg,
                         bytes_written: 0,
                     }));
-                }
-                if let Some(ref f) = target_file {
-                    let _ = f.sync_all();
                 }
                 Ok(Response::new(volume_server_pb::ReceiveFileResponse {
                     error: String::new(),
@@ -2573,7 +2633,7 @@ impl VolumeServer for VolumeGrpcService {
                     drop(f);
                 }
                 if let Some(ref p) = file_path {
-                    let _ = std::fs::remove_file(p);
+                    let _ = tokio::fs::remove_file(p).await;
                 }
                 Err(e)
             }
@@ -2588,11 +2648,31 @@ impl VolumeServer for VolumeGrpcService {
         let vid = VolumeId(req.volume_id);
         let offset = req.offset;
         let size = Size(req.size);
+        if let Err(msg) = crate::storage::needle::needle::validate_wire_size(size) {
+            return Err(Status::invalid_argument(msg));
+        }
 
-        let store = self.state.store.read().unwrap();
+        let store = self.store_read();
         let (_, vol) = store
             .find_volume(vid)
             .ok_or_else(|| Status::not_found(format!("not found volume id {}", vid)))?;
+
+        // Framing: request `size` is body size, but read_needle_blob returns
+        // GetActualSize bytes + protobuf tag/len, so body==1<<30 always exceeds
+        // GRPC_MAX_MESSAGE_SIZE on the wire after allocation+disk read.
+        // Check actual encoded size post-lock (have vol.version() here).
+        // The 6-byte headroom is the exact protobuf overhead for this
+        // response at the boundary: 1 tag byte (`bytes needle_blob = 1`)
+        // plus a 5-byte varint length for sizes near 1 GiB. Sizes whose
+        // encoded form still fits are therefore accepted; anything larger
+        // is rejected before paying for the disk read.
+        let actual = crate::storage::needle::needle::get_actual_size(size, vol.version()) as u64;
+        if actual + 6 > crate::server::grpc_client::GRPC_MAX_MESSAGE_SIZE as u64 {
+            return Err(Status::invalid_argument(format!(
+                "needle blob size {} exceeds transport limit",
+                actual
+            )));
+        }
 
         let blob = vol.read_needle_blob(offset, size).map_err(|e| {
             Status::internal(format!(
@@ -2652,8 +2732,11 @@ impl VolumeServer for VolumeGrpcService {
         let vid = VolumeId(req.volume_id);
         let needle_id = NeedleId(req.needle_id);
         let size = Size(req.size);
+        if let Err(msg) = crate::storage::needle::needle::validate_wire_size(size) {
+            return Err(Status::invalid_argument(msg));
+        }
 
-        let mut store = self.state.store.write().unwrap();
+        let mut store = self.store_write();
         let (_, vol) = store
             .find_volume_mut(vid)
             .ok_or_else(|| Status::not_found(format!("not found volume id {}", vid)))?;
@@ -2748,7 +2831,6 @@ impl VolumeServer for VolumeGrpcService {
 
         let state = self.state.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(32);
-        const BUFFER_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 
         tokio::spawn(async move {
             let since_ns = req.since_ns;
@@ -2757,120 +2839,50 @@ impl VolumeServer for VolumeGrpcService {
             let mut draining_seconds = idle_timeout as i64;
 
             loop {
-                // Resolve the start offset and the caught-up flag under one
-                // store read guard. is_last means the caller is caught up: send
-                // a heartbeat without scanning, as Go does. Dropping that flag
-                // re-reads the whole volume every iteration (a moved volume is
-                // read-only, so it is always caught up). The single guard
-                // spans both the search and the scan: a vacuum commit takes
-                // the store write lock and rewrites .dat/.idx, so an offset
-                // resolved under one guard would point into a different file
-                // under the next.
-                let resolved = {
-                    let store = state.store.read().unwrap();
-                    match store.find_volume(vid) {
-                        Some((_, vol)) => {
-                            let start = if last_timestamp_ns > 0 {
-                                match vol.binary_search_by_append_at_ns(last_timestamp_ns) {
-                                    Ok((offset, is_last)) => {
-                                        let off = if offset.is_zero() {
-                                            sb_size
-                                        } else {
-                                            offset.to_actual_offset() as u64
-                                        };
-                                        Ok((off, is_last))
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "fail to locate by appendAtNs {}: {}",
-                                            last_timestamp_ns,
-                                            e
-                                        );
-                                        Err(format!(
-                                            "fail to locate by appendAtNs {}: {}",
-                                            last_timestamp_ns, e
-                                        ))
-                                    }
-                                }
-                            } else {
-                                // No timestamp yet: the caller wants everything.
-                                Ok((sb_size, false))
-                            };
-                            Some(start.map(|(off, is_last)| {
-                                if is_last {
-                                    None
-                                } else {
-                                    Some(vol.scan_raw_needles_from(off))
-                                }
-                            }))
-                        }
-                        None => None,
-                    }
-                };
+                // The search and the scan are blocking file (or S3) I/O, so
+                // each pass runs on a blocking thread and takes and drops the
+                // store guard itself (see tail_pass). The heartbeat, the sleep
+                // and the draining countdown stay here, so no thread is parked
+                // while the stream is idle.
+                let pass_state = state.clone();
+                let pass_tx = tx.clone();
+                let pass = tokio::task::spawn_blocking(move || {
+                    tail_pass(
+                        &pass_state,
+                        vid,
+                        sb_size,
+                        version,
+                        last_timestamp_ns,
+                        &pass_tx,
+                    )
+                })
+                .await;
 
-                let scan_result = match resolved {
-                    None => break,
-                    Some(Err(msg)) => {
+                let (last_processed_ns, sent_any) = match pass {
+                    Ok(TailPass::Scanned {
+                        last_processed_ns,
+                        sent_any,
+                    }) => (last_processed_ns, sent_any),
+                    // Caught up: heartbeat WITHOUT scanning, as Go does.
+                    Ok(TailPass::CaughtUp) => (last_timestamp_ns, false),
+                    Ok(TailPass::VolumeGone) => break,
+                    Ok(TailPass::ClientGone) => return,
+                    Ok(TailPass::Failed(msg)) => {
                         let _ = tx.send(Err(Status::internal(msg))).await;
                         return;
                     }
-                    Some(Ok(scan_result)) => scan_result,
-                };
-
-                // Caught up: heartbeat WITHOUT scanning, as Go does.
-                let Some(scan_result) = scan_result else {
-                    let msg = volume_server_pb::VolumeTailSenderResponse {
-                        is_last_chunk: true,
-                        version,
-                        ..Default::default()
-                    };
-                    if tx.send(Ok(msg)).await.is_err() {
+                    // A panic on the blocking thread must not look like a
+                    // clean end of stream to the receiver.
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(Status::internal(format!(
+                                "streamFollow: tail pass for volume {} failed: {}",
+                                vid, e
+                            ))))
+                            .await;
                         return;
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    if idle_timeout == 0 {
-                        continue;
-                    }
-                    draining_seconds -= 1;
-                    if draining_seconds <= 0 {
-                        return; // EOF
-                    }
-                    continue;
                 };
-
-                let entries = match scan_result {
-                    Ok(e) => e,
-                    Err(_) => break,
-                };
-                // Filter entries since last_timestamp_ns
-                let mut last_processed_ns = last_timestamp_ns;
-                let mut sent_any = false;
-                for (header, body, append_at_ns) in &entries {
-                    if *append_at_ns <= last_timestamp_ns && last_timestamp_ns > 0 {
-                        continue;
-                    }
-                    sent_any = true;
-                    // Send body in chunks of BUFFER_SIZE_LIMIT
-                    // Go sends needle_header on every chunk
-                    let mut i = 0;
-                    while i < body.len() {
-                        let end = std::cmp::min(i + BUFFER_SIZE_LIMIT, body.len());
-                        let is_last_chunk = end >= body.len();
-                        let msg = volume_server_pb::VolumeTailSenderResponse {
-                            needle_header: header.clone(),
-                            needle_body: body[i..end].to_vec(),
-                            is_last_chunk,
-                            version,
-                        };
-                        if tx.send(Ok(msg)).await.is_err() {
-                            return;
-                        }
-                        i = end;
-                    }
-                    if *append_at_ns > last_processed_ns {
-                        last_processed_ns = *append_at_ns;
-                    }
-                }
 
                 if !sent_any {
                     // Send heartbeat
@@ -2914,6 +2926,17 @@ impl VolumeServer for VolumeGrpcService {
         let req = request.into_inner();
         let vid = VolumeId(req.volume_id);
 
+        if !self.state.allow_untrusted_remote_endpoints {
+            crate::remote_storage::validate_replica_target(&req.source_volume_server)
+                .await
+                .map_err(|e| {
+                    Status::invalid_argument(format!(
+                        "invalid source volume server {}: {}",
+                        req.source_volume_server, e
+                    ))
+                })?;
+        }
+
         // Check volume exists
         {
             let store = self.state.store.read().unwrap();
@@ -2927,19 +2950,17 @@ impl VolumeServer for VolumeGrpcService {
         let grpc_addr = parse_grpc_address(source)
             .map_err(|e| Status::internal(format!("invalid source address {}: {}", source, e)))?;
 
-        let channel = build_grpc_endpoint(&grpc_addr, self.state.outgoing_grpc_tls.as_ref())
-            .map_err(|e| Status::internal(format!("parse source: {}", e)))?
-            .connect()
-            .await
-            .map_err(|e| Status::internal(format!("connect to {}: {}", grpc_addr, e)))?;
+        let channel = connect_channel_guarded(
+            &grpc_addr,
+            source,
+            self.state.outgoing_grpc_tls.as_ref(),
+            GrpcDialOptions::stream(),
+            self.state.allow_untrusted_remote_endpoints,
+        )
+        .await
+        .map_err(|e| Status::internal(format!("connect to {}: {}", grpc_addr, e)))?;
 
-        let mut client =
-            volume_server_pb::volume_server_client::VolumeServerClient::with_interceptor(
-                channel,
-                super::request_id::outgoing_request_id_interceptor,
-            )
-            .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE)
-            .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE);
+        let mut client = volume_server_client(channel);
 
         // Call VolumeTailSender on source
         let mut stream = client
@@ -3002,7 +3023,7 @@ impl VolumeServer for VolumeGrpcService {
                 // (V3) or checksum only (V2) + padding. Validate minimum
                 // footer length for the protocol version.
                 use crate::storage::types::{
-                    Version, NEEDLE_CHECKSUM_SIZE, TIMESTAMP_SIZE, VERSION_3,
+                    NEEDLE_CHECKSUM_SIZE, TIMESTAMP_SIZE, VERSION_3, Version,
                 };
                 let version = Version(resp_version as u8);
                 let min_footer = if version >= VERSION_3 {
@@ -3013,7 +3034,10 @@ impl VolumeServer for VolumeGrpcService {
                 if needle_body.len() < min_footer {
                     return Err(Status::invalid_argument(format!(
                         "tombstone needle {} body too short: got {} bytes, need >= {} for version {}",
-                        n.id.0, needle_body.len(), min_footer, resp_version
+                        n.id.0,
+                        needle_body.len(),
+                        min_footer,
+                        resp_version
                     )));
                 }
             }
@@ -3108,8 +3132,8 @@ impl VolumeServer for VolumeGrpcService {
                 dat_file_size,
                 expire_at_sec,
                 ec_shard_config: Some(crate::storage::volume::VifEcShardConfig {
-                    data_shards: data_shards,
-                    parity_shards: parity_shards,
+                    data_shards,
+                    parity_shards,
                     // This run's identity; the read path rejects a shard from a
                     // different encode run.
                     encode_ts_ns: std::time::SystemTime::now()
@@ -3348,6 +3372,25 @@ impl VolumeServer for VolumeGrpcService {
         let req = request.into_inner();
         let vid = VolumeId(req.volume_id);
 
+        if !self.state.allow_untrusted_remote_endpoints {
+            crate::remote_storage::validate_replica_target(&req.source_data_node)
+                .await
+                .map_err(|e| {
+                    Status::invalid_argument(format!(
+                        "invalid source data node {}: {}",
+                        req.source_data_node, e
+                    ))
+                })?;
+        }
+
+        // Validate wire shard ids at the boundary: ShardId is u8 but only
+        // 0..MAX_SHARD_COUNT are valid. Rejects 256 (would truncate to 0)
+        // and 270 (would alias 14).
+        let mut shard_ids: Vec<ShardId> = Vec::with_capacity(req.shard_ids.len());
+        for &sid in &req.shard_ids {
+            shard_ids.push(shard_id_try_from(sid).map_err(Status::invalid_argument)?);
+        }
+
         // Select target location:
         //   When disk_id > 0: use that specific location.
         //   When disk_id == 0 (unset): auto-select via
@@ -3381,7 +3424,7 @@ impl VolumeServer for VolumeGrpcService {
                 // writing them all to one disk would duplicate the other
                 // disks' claims. Refuse so the caller splits the batch per
                 // shard (or chooses explicitly via disk_id).
-                let owners = store.ec_shard_owner_disks(vid, &req.shard_ids);
+                let owners = store.ec_shard_owner_disks(vid, &shard_ids);
                 if owners.len() > 1 {
                     let dirs: Vec<&str> = owners
                         .iter()
@@ -3389,14 +3432,14 @@ impl VolumeServer for VolumeGrpcService {
                         .collect();
                     return Err(Status::failed_precondition(format!(
                         "volume {} shards {:?} are already owned by multiple local disks {:?}: no single destination; copy per shard or pass disk_id",
-                        req.volume_id, req.shard_ids, dirs
+                        req.volume_id, shard_ids, dirs
                     )));
                 }
                 match store.find_ec_shard_target_location(
                     &req.collection,
                     vid,
                     DATA_SHARDS_COUNT as u32,
-                    &req.shard_ids,
+                    &shard_ids,
                 ) {
                     Some(i) => {
                         let loc = &store.locations[i];
@@ -3418,32 +3461,25 @@ impl VolumeServer for VolumeGrpcService {
             ))
         })?;
 
-        let channel = build_grpc_endpoint(&grpc_addr, self.state.outgoing_grpc_tls.as_ref())
-            .map_err(|e| {
-                Status::internal(format!(
-                    "VolumeEcShardsCopy volume {} parse source: {}",
-                    vid, e
-                ))
-            })?
-            .connect()
-            .await
-            .map_err(|e| {
-                Status::internal(format!(
-                    "VolumeEcShardsCopy volume {} connect to {}: {}",
-                    vid, grpc_addr, e
-                ))
-            })?;
+        let channel = connect_channel_guarded(
+            &grpc_addr,
+            source,
+            self.state.outgoing_grpc_tls.as_ref(),
+            GrpcDialOptions::stream(),
+            self.state.allow_untrusted_remote_endpoints,
+        )
+        .await
+        .map_err(|e| {
+            Status::internal(format!(
+                "VolumeEcShardsCopy volume {} connect to {}: {}",
+                vid, grpc_addr, e
+            ))
+        })?;
 
-        let mut client =
-            volume_server_pb::volume_server_client::VolumeServerClient::with_interceptor(
-                channel,
-                super::request_id::outgoing_request_id_interceptor,
-            )
-            .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE)
-            .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE);
+        let mut client = volume_server_client(channel);
 
         // Copy each shard
-        for &shard_id in &req.shard_ids {
+        for &shard_id in &shard_ids {
             let ext = format!(".ec{:02}", shard_id);
             let copy_req = volume_server_pb::CopyFileRequest {
                 volume_id: req.volume_id,
@@ -3700,7 +3736,11 @@ impl VolumeServer for VolumeGrpcService {
         }
 
         let mut store = self.state.store.write().unwrap();
-        store.delete_ec_shards(vid, &req.collection, &req.shard_ids);
+        let mut shard_ids: Vec<ShardId> = Vec::with_capacity(req.shard_ids.len());
+        for &sid in &req.shard_ids {
+            shard_ids.push(shard_id_try_from(sid).map_err(Status::invalid_argument)?);
+        }
+        store.delete_ec_shards(vid, &req.collection, &shard_ids);
         drop(store);
         self.state.volume_state_notify.notify_one();
         Ok(Response::new(
@@ -3717,6 +3757,17 @@ impl VolumeServer for VolumeGrpcService {
         let req = request.into_inner();
         let vid = VolumeId(req.volume_id);
 
+        // Pre-validate the ENTIRE batch before any mutation: validating inside
+        // the mount loop would mount a prefix (e.g. shard 0 of [0, 32]) and
+        // then fail, leaving a partial mutation while skipping the sidecar
+        // reload + notify below. Reject up front so invalid batches change no
+        // state.
+        // Validate wire shard ids at the boundary (rejects truncation aliases like 256→0).
+        let mut validated: Vec<ShardId> = Vec::with_capacity(req.shard_ids.len());
+        for &sid in &req.shard_ids {
+            validated.push(shard_id_try_from(sid).map_err(Status::invalid_argument)?);
+        }
+
         // Fetch a missing .ecx from a peer first so on-disk shards that never had
         // a local index can be mounted (issue #10104). Driven on demand by
         // ec.rebuild. volume_id 0 recovers every orphan on this server, including
@@ -3728,7 +3779,7 @@ impl VolumeServer for VolumeGrpcService {
         // Mount one shard at a time, returning error on first failure.
         // Matches Go: for _, shardId := range req.ShardIds { err = vs.store.MountEcShards(...) }
         let mut store = self.state.store.write().unwrap();
-        for &shard_id in &req.shard_ids {
+        for &shard_id in &validated {
             store
                 .mount_ec_shard(vid, &req.collection, shard_id, &req.source_disk_type)
                 .map_err(|e| {
@@ -3772,10 +3823,20 @@ impl VolumeServer for VolumeGrpcService {
         let req = request.into_inner();
         let vid = VolumeId(req.volume_id);
 
+        // Pre-validate the ENTIRE batch before acquiring the write lock or
+        // mutating: validating inside the unmount loop would unmount a prefix
+        // (e.g. shard 0 of [0, 32]) and then fail, leaving a partial mutation.
+        // Reject up front so invalid batches change no state. Auth stays first.
+        // Validate wire shard ids at the boundary (rejects truncation aliases like 256→0).
+        let mut validated: Vec<ShardId> = Vec::with_capacity(req.shard_ids.len());
+        for &sid in &req.shard_ids {
+            validated.push(shard_id_try_from(sid).map_err(Status::invalid_argument)?);
+        }
+
         // Unmount one shard at a time, returning error on first failure.
         // Matches Go: for _, shardId := range req.ShardIds { err = vs.store.UnmountEcShards(...) }
         let mut store = self.state.store.write().unwrap();
-        for &shard_id in &req.shard_ids {
+        for &shard_id in &validated {
             store
                 .unmount_ec_shard(vid, shard_id, req.encode_ts_ns)
                 .map_err(|e| {
@@ -3796,6 +3857,7 @@ impl VolumeServer for VolumeGrpcService {
     ) -> Result<Response<Self::VolumeEcShardReadStream>, Status> {
         let req = request.into_inner();
         let vid = VolumeId(req.volume_id);
+        let shard_id = shard_id_try_from(req.shard_id).map_err(Status::invalid_argument)?;
 
         let store = self.state.store.read().unwrap();
         // Reconciled EC volumes can have their shards split across
@@ -3804,7 +3866,7 @@ impl VolumeServer for VolumeGrpcService {
         // rather than first-match `find_ec_volume(vid)` which would
         // miss shards that live on a sibling. Mirrors Go's findEcShard.
         let ec_vol = store
-            .find_ec_volume_with_shard(vid, req.shard_id)
+            .find_ec_volume_with_shard(vid, shard_id)
             .ok_or_else(|| {
                 Status::not_found(format!(
                     "ec volume {} shard {} not found",
@@ -3833,15 +3895,14 @@ impl VolumeServer for VolumeGrpcService {
             if let Some((_offset, size)) = ec_vol
                 .find_needle_from_ecx(needle_id)
                 .map_err(|e| Status::internal(e.to_string()))?
+                && size.is_deleted()
             {
-                if size.is_deleted() {
-                    let results = vec![Ok(volume_server_pb::VolumeEcShardReadResponse {
-                        is_deleted: true,
-                        encode_ts_ns: served_encode_ts_ns,
-                        ..Default::default()
-                    })];
-                    return Ok(Response::new(Box::pin(tokio_stream::iter(results))));
-                }
+                let results = vec![Ok(volume_server_pb::VolumeEcShardReadResponse {
+                    is_deleted: true,
+                    encode_ts_ns: served_encode_ts_ns,
+                    ..Default::default()
+                })];
+                return Ok(Response::new(Box::pin(tokio_stream::iter(results))));
             }
         }
 
@@ -3849,7 +3910,7 @@ impl VolumeServer for VolumeGrpcService {
         // find_ec_volume_with_shard already verified it.
         let shard = ec_vol
             .shards
-            .get(req.shard_id as usize)
+            .get(shard_id as usize)
             .and_then(|s| s.as_ref())
             .ok_or_else(|| {
                 Status::not_found(format!(
@@ -3910,18 +3971,24 @@ impl VolumeServer for VolumeGrpcService {
         let vid = VolumeId(req.volume_id);
         let needle_id = NeedleId(req.file_key);
 
-        // Go checks if needle is already deleted (via ecx) before journaling.
-        // Search all locations for the EC volume.
+        // Go's handler locates the needle first: absent fails the RPC so the
+        // caller moves to the next holder; an existing tombstone is a no-op.
         let mut store = self.state.store.write().unwrap();
         if let Some(ec_vol) = store.find_ec_volume_mut(vid) {
-            // Check if already deleted via ecx index
-            if let Ok(Some((_offset, size))) = ec_vol.find_needle_from_ecx(needle_id) {
-                if size.is_deleted() {
-                    // Already deleted, no-op
+            match ec_vol.find_needle_from_ecx(needle_id) {
+                Ok(Some((_, size))) if size.is_deleted() => {
                     return Ok(Response::new(
                         volume_server_pb::VolumeEcBlobDeleteResponse {},
                     ));
                 }
+                Ok(None) => {
+                    return Err(Status::not_found(format!(
+                        "needle {} not in ec volume {}",
+                        needle_id, req.volume_id
+                    )));
+                }
+                Ok(Some(_)) => {}
+                Err(e) => return Err(Status::internal(e.to_string())),
             }
             ec_vol
                 .journal_delete(needle_id)
@@ -4056,8 +4123,8 @@ impl VolumeServer for VolumeGrpcService {
         }
 
         // Check that all data shards are present somewhere on this server.
-        for shard_id in 0..data_shards {
-            if shard_dirs[shard_id].is_none() {
+        for (shard_id, dir) in shard_dirs[..data_shards].iter().enumerate() {
+            if dir.is_none() {
                 return Err(Status::internal(format!(
                     "ec volume {} missing shard {}",
                     req.volume_id, shard_id
@@ -4124,16 +4191,18 @@ impl VolumeServer for VolumeGrpcService {
         // dat_file_size. The decoder infers the layout from the shard size
         // when .vif does not record it.
         // Write .dat file using block-interleaved reading from shards.
-        crate::storage::erasure_coding::ec_decoder::write_dat_file_from_shards_with_dirs(
-            &dat_dir,
-            &collection,
-            vid,
-            dat_file_size,
-            vif_dat_file_size,
-            data_shards,
-            &per_shard_dirs,
-            large_block_size as usize,
-            small_block_size as usize,
+        crate::storage::erasure_coding::ec_decoder::write_dat_file_from_shards(
+            &crate::storage::erasure_coding::ec_decoder::DatRebuild {
+                dat_dir: &dat_dir,
+                collection: &collection,
+                volume_id: vid,
+                dat_file_size,
+                encoded_dat_file_size: vif_dat_file_size,
+                data_shards,
+                shard_dirs: Some(&per_shard_dirs),
+                large_block_size: large_block_size as usize,
+                small_block_size: small_block_size as usize,
+            },
         )
         .map_err(|e| Status::internal(format!("WriteDatFile: {}", e)))?;
 
@@ -4245,7 +4314,7 @@ impl VolumeServer for VolumeGrpcService {
 
             // Match Go's DiskFile check: if the .dat file is still local, we can
             // keep tiering it even when remote file entries already exist.
-            if volume_is_remote_only(&dat_path, vol.has_remote_file) {
+            if volume_is_remote_only(&dat_path, vol.has_remote_file()) {
                 // Already on remote -- return empty stream (matches Go: returns nil)
                 let stream = tokio_stream::empty();
                 return Ok(Response::new(
@@ -4258,7 +4327,7 @@ impl VolumeServer for VolumeGrpcService {
                 crate::remote_storage::s3_tier::backend_name_to_type_id(
                     &req.destination_backend_name,
                 );
-            for rf in &vol.volume_info.files {
+            for rf in &vol.volume_info().files {
                 if rf.backend_type == backend_type && rf.backend_id == backend_id {
                     return Err(Status::already_exists(format!(
                         "destination {} already exists",
@@ -4281,7 +4350,9 @@ impl VolumeServer for VolumeGrpcService {
 
         // Look up the S3 tier backend
         let backend = {
-            let registry = self.state.s3_tier_registry.read().unwrap();
+            let registry = crate::remote_storage::s3_tier::global_s3_tier_registry()
+                .read()
+                .unwrap();
             registry.get(&req.destination_backend_name).ok_or_else(|| {
                 let keys = registry.names();
                 Status::not_found(format!(
@@ -4367,16 +4438,18 @@ impl VolumeServer for VolumeGrpcService {
                 {
                     let mut store = state.store.write().unwrap();
                     if let Some((_, vol)) = store.find_volume_mut(vid) {
-                        vol.volume_info.files.push(volume_server_pb::RemoteFile {
-                            backend_type: backend_type.clone(),
-                            backend_id: backend_id.clone(),
-                            key,
-                            offset: 0,
-                            file_size: size,
-                            modified_time: dat_modified_secs,
-                            extension: ".dat".to_string(),
-                        });
-                        vol.refresh_remote_write_mode().map_err(|e| {
+                        vol.update_remote_files(|files| {
+                            files.push(volume_server_pb::RemoteFile {
+                                backend_type: backend_type.clone(),
+                                backend_id: backend_id.clone(),
+                                key,
+                                offset: 0,
+                                file_size: size,
+                                modified_time: dat_modified_secs,
+                                extension: ".dat".to_string(),
+                            })
+                        })
+                        .map_err(|e| {
                             Status::internal(format!(
                                 "volume {} failed to refresh write mode: {}",
                                 vid, e
@@ -4474,7 +4547,7 @@ impl VolumeServer for VolumeGrpcService {
             }
 
             let remote_modified_secs = vol
-                .volume_info
+                .volume_info()
                 .files
                 .first()
                 .map(|f| f.modified_time)
@@ -4485,7 +4558,9 @@ impl VolumeServer for VolumeGrpcService {
 
         // Look up the S3 tier backend
         let backend = {
-            let registry = self.state.s3_tier_registry.read().unwrap();
+            let registry = crate::remote_storage::s3_tier::global_s3_tier_registry()
+                .read()
+                .unwrap();
             registry.get(&storage_name).ok_or_else(|| {
                 let keys = registry.names();
                 Status::not_found(format!(
@@ -4560,15 +4635,15 @@ impl VolumeServer for VolumeGrpcService {
                         // a local .dat exists, so leaving one wedges every
                         // retry on "already on local disk", and a restart would
                         // load the sparse file as the volume's data.
-                        if let Err(rm) = std::fs::remove_file(&dat_path) {
-                            if rm.kind() != std::io::ErrorKind::NotFound {
-                                tracing::warn!(
-                                    "volume {} could not remove the incomplete download {}: {}",
-                                    vid,
-                                    dat_path,
-                                    rm
-                                );
-                            }
+                        if let Err(rm) = std::fs::remove_file(&dat_path)
+                            && rm.kind() != std::io::ErrorKind::NotFound
+                        {
+                            tracing::warn!(
+                                "volume {} could not remove the incomplete download {}: {}",
+                                vid,
+                                dat_path,
+                                rm
+                            );
                         }
                         Status::internal(format!(
                             "backend {} copy file {}: {}",
@@ -4613,7 +4688,7 @@ impl VolumeServer for VolumeGrpcService {
 
                 // Trim the remote reference, persist the .vif, and swap to the local
                 // .dat on BOTH paths BEFORE deleting the remote object. After this the
-                // volume serves from local disk (has_remote_file = false), so a crash
+                // volume serves from local disk (has_remote_file() is false), so a crash
                 // before the delete only leaks the remote object; the .vif must never
                 // reference an object that has already been deleted.
                 {
@@ -4634,28 +4709,31 @@ impl VolumeServer for VolumeGrpcService {
                     }
 
                     // Snapshot the remote reference before dropping it: the
-                    // refresh below can fail, and a half-applied transition
+                    // refresh it triggers can fail, and a half-applied transition
                     // leaves the volume claiming local while the remote backend
                     // is still attached and the on-disk .vif still says remote
                     // — a state a retry reads as "already on local disk" and
                     // refuses to finish.
-                    let removed_remote = if vol.volume_info.files.is_empty() {
-                        None
-                    } else {
-                        Some(vol.volume_info.files.remove(0))
-                    };
-                    // Swaps the read-only sorted map out before the volume is
-                    // published as writable; without it the first write would
-                    // append to the local .dat and then fail to index.
-                    if let Err(e) = vol.refresh_remote_write_mode() {
-                        if let Some(remote) = removed_remote {
-                            vol.volume_info.files.insert(0, remote);
+                    //
+                    // update_remote_files also swaps the read-only sorted map
+                    // out before the volume is published as writable; without
+                    // it the first write would append to the local .dat and
+                    // then fail to index.
+                    let mut removed_remote = None;
+                    if let Err(e) = vol.update_remote_files(|files| {
+                        if !files.is_empty() {
+                            removed_remote = Some(files.remove(0));
                         }
-                        // Put the derived flags and the needle map back where
-                        // the restored reference says they belong. Best effort:
-                        // if even this fails the volume stays pinned read-only,
-                        // which is the safe end of the transition.
-                        if let Err(restore_err) = vol.refresh_remote_write_mode() {
+                    }) {
+                        // Put the reference, the derived flags and the needle
+                        // map back where they belong. Best effort: if even this
+                        // fails the volume stays pinned read-only, which is the
+                        // safe end of the transition.
+                        if let Err(restore_err) = vol.update_remote_files(|files| {
+                            if let Some(remote) = removed_remote {
+                                files.insert(0, remote);
+                            }
+                        }) {
                             tracing::warn!(
                                 volume_id = vid.0,
                                 error = %restore_err,
@@ -4823,16 +4901,13 @@ impl VolumeServer for VolumeGrpcService {
         // provider default (e.g. real AWS S3) and cannot target an internal
         // host, so skip it. Extends the Go volume server's validateRemoteEndpoint
         // gate, which only covered type "s3".
-        if !self.state.allow_untrusted_remote_endpoints {
-            if let Some(endpoint) = crate::remote_storage::s3_compatible_endpoint(remote_conf) {
-                if !endpoint.trim().is_empty() {
-                    crate::remote_storage::validate_remote_endpoint(endpoint)
-                        .await
-                        .map_err(|e| {
-                            Status::invalid_argument(format!("reject remote endpoint: {}", e))
-                        })?;
-                }
-            }
+        if !self.state.allow_untrusted_remote_endpoints
+            && let Some(endpoint) = crate::remote_storage::s3_compatible_endpoint(remote_conf)
+            && !endpoint.trim().is_empty()
+        {
+            crate::remote_storage::validate_remote_endpoint(endpoint)
+                .await
+                .map_err(|e| Status::invalid_argument(format!("reject remote endpoint: {}", e)))?;
         }
 
         // Create remote storage client
@@ -4979,7 +5054,7 @@ impl VolumeServer for VolumeGrpcService {
                 return Err(Status::invalid_argument(format!(
                     "unsupported volume scrub mode {}",
                     mode
-                )))
+                )));
             }
         }
 
@@ -5003,12 +5078,12 @@ impl VolumeServer for VolumeGrpcService {
         // Validate mode
         let mode = req.mode;
         match mode {
-            1 | 2 | 3 | 4 | 5 => {} // INDEX=1, FULL=2, LOCAL=3, CHECKSUM=4, READS=5
+            1..=5 => {} // INDEX=1, FULL=2, LOCAL=3, CHECKSUM=4, READS=5
             _ => {
                 return Err(Status::invalid_argument(format!(
                     "unsupported EC volume scrub mode {}",
                     mode
-                )))
+                )));
             }
         }
 
@@ -5053,7 +5128,7 @@ impl VolumeServer for VolumeGrpcService {
         let mut stripes: Vec<Result<volume_server_pb::QueriedStripe, Status>> = Vec::new();
 
         for fid_str in &req.from_file_ids {
-            let file_id = needle::FileId::parse(fid_str).map_err(|e| Status::internal(e))?;
+            let file_id = needle::FileId::parse(fid_str).map_err(Status::internal)?;
 
             let mut n = Needle {
                 id: file_id.key,
@@ -5081,13 +5156,13 @@ impl VolumeServer for VolumeGrpcService {
             let input = req.input_serialization.as_ref();
 
             // CSV input: no output (Go does nothing for CSV)
-            if input.map_or(false, |i| i.csv_input.is_some()) {
+            if input.is_some_and(|i| i.csv_input.is_some()) {
                 // No stripes emitted for CSV
                 continue;
             }
 
             // JSON input: process lines
-            if input.map_or(false, |i| i.json_input.is_some()) {
+            if input.is_some_and(|i| i.json_input.is_some()) {
                 let filter = req.filter.as_ref();
                 let data_str = String::from_utf8_lossy(&n.data);
                 let mut records: Vec<u8> = Vec::new();
@@ -5102,69 +5177,70 @@ impl VolumeServer for VolumeGrpcService {
                     };
 
                     // Apply filter
-                    if let Some(f) = filter {
-                        if !f.field.is_empty() && !f.operand.is_empty() {
-                            let field_val = &parsed[&f.field];
-                            let pass = match f.operand.as_str() {
-                                ">" => {
-                                    if let (Some(fv), Ok(tv)) =
-                                        (field_val.as_f64(), f.value.parse::<f64>())
-                                    {
-                                        fv > tv
-                                    } else {
-                                        false
-                                    }
+                    if let Some(f) = filter
+                        && !f.field.is_empty()
+                        && !f.operand.is_empty()
+                    {
+                        let field_val = &parsed[&f.field];
+                        let pass = match f.operand.as_str() {
+                            ">" => {
+                                if let (Some(fv), Ok(tv)) =
+                                    (field_val.as_f64(), f.value.parse::<f64>())
+                                {
+                                    fv > tv
+                                } else {
+                                    false
                                 }
-                                ">=" => {
-                                    if let (Some(fv), Ok(tv)) =
-                                        (field_val.as_f64(), f.value.parse::<f64>())
-                                    {
-                                        fv >= tv
-                                    } else {
-                                        false
-                                    }
-                                }
-                                "<" => {
-                                    if let (Some(fv), Ok(tv)) =
-                                        (field_val.as_f64(), f.value.parse::<f64>())
-                                    {
-                                        fv < tv
-                                    } else {
-                                        false
-                                    }
-                                }
-                                "<=" => {
-                                    if let (Some(fv), Ok(tv)) =
-                                        (field_val.as_f64(), f.value.parse::<f64>())
-                                    {
-                                        fv <= tv
-                                    } else {
-                                        false
-                                    }
-                                }
-                                "=" => {
-                                    if let (Some(fv), Ok(tv)) =
-                                        (field_val.as_f64(), f.value.parse::<f64>())
-                                    {
-                                        fv == tv
-                                    } else {
-                                        field_val.as_str().map_or(false, |s| s == f.value)
-                                    }
-                                }
-                                "!=" => {
-                                    if let (Some(fv), Ok(tv)) =
-                                        (field_val.as_f64(), f.value.parse::<f64>())
-                                    {
-                                        fv != tv
-                                    } else {
-                                        field_val.as_str().map_or(true, |s| s != f.value)
-                                    }
-                                }
-                                _ => true,
-                            };
-                            if !pass {
-                                continue;
                             }
+                            ">=" => {
+                                if let (Some(fv), Ok(tv)) =
+                                    (field_val.as_f64(), f.value.parse::<f64>())
+                                {
+                                    fv >= tv
+                                } else {
+                                    false
+                                }
+                            }
+                            "<" => {
+                                if let (Some(fv), Ok(tv)) =
+                                    (field_val.as_f64(), f.value.parse::<f64>())
+                                {
+                                    fv < tv
+                                } else {
+                                    false
+                                }
+                            }
+                            "<=" => {
+                                if let (Some(fv), Ok(tv)) =
+                                    (field_val.as_f64(), f.value.parse::<f64>())
+                                {
+                                    fv <= tv
+                                } else {
+                                    false
+                                }
+                            }
+                            "=" => {
+                                if let (Some(fv), Ok(tv)) =
+                                    (field_val.as_f64(), f.value.parse::<f64>())
+                                {
+                                    fv == tv
+                                } else {
+                                    field_val.as_str().is_some_and(|s| s == f.value)
+                                }
+                            }
+                            "!=" => {
+                                if let (Some(fv), Ok(tv)) =
+                                    (field_val.as_f64(), f.value.parse::<f64>())
+                                {
+                                    fv != tv
+                                } else {
+                                    field_val.as_str().is_none_or(|s| s != f.value)
+                                }
+                            }
+                            _ => true,
+                        };
+                        if !pass {
+                            continue;
                         }
                     }
 
@@ -5208,7 +5284,7 @@ impl VolumeServer for VolumeGrpcService {
         let store = self.state.store.read().unwrap();
 
         // Try normal volume first
-        if let Some(_) = store.find_volume(vid) {
+        if store.find_volume(vid).is_some() {
             let mut n = Needle {
                 id: needle_id,
                 ..Needle::default()
@@ -5307,7 +5383,7 @@ impl VolumeServer for VolumeGrpcService {
                     return Err(Status::internal(format!(
                         "ping {} {}: {}",
                         req.target_type, req.target, e
-                    )))
+                    )));
                 }
             }
         } else if req.target_type == "master" {
@@ -5318,7 +5394,7 @@ impl VolumeServer for VolumeGrpcService {
                     return Err(Status::internal(format!(
                         "ping {} {}: {}",
                         req.target_type, req.target, e
-                    )))
+                    )));
                 }
             }
         } else if req.target_type == "filer" {
@@ -5328,7 +5404,7 @@ impl VolumeServer for VolumeGrpcService {
                     return Err(Status::internal(format!(
                         "ping {} {}: {}",
                         req.target_type, req.target, e
-                    )))
+                    )));
                 }
             }
         } else {
@@ -5345,13 +5421,26 @@ impl VolumeServer for VolumeGrpcService {
     }
 }
 
-/// Build a gRPC endpoint from a SeaweedFS server address.
-fn to_grpc_endpoint(
+/// Dial a ping target, bounding the whole connect at 5s.
+///
+/// The outer timeout is not redundant with `GrpcDialOptions`' connect timeout:
+/// tonic hands that one to the HTTP connector, so it bounds the TCP dial only.
+/// A ping to a TLS peer that accepts the connection and then stalls in the
+/// handshake needs this wrapper to come back at all.
+async fn connect_ping_target(
     target: &str,
     tls: Option<&super::grpc_client::OutgoingGrpcTlsConfig>,
-) -> Result<tonic::transport::Endpoint, String> {
+) -> Result<tonic::transport::Channel, String> {
     let grpc_host_port = parse_grpc_address(target)?;
-    build_grpc_endpoint(&grpc_host_port, tls).map_err(|e| e.to_string())
+    // Ping is unary, but `stream()` is still right: these three have no
+    // per-request deadline today, and `unary()` would add a 10 s one.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        connect_channel(&grpc_host_port, tls, GrpcDialOptions::stream()),
+    )
+    .await
+    .map_err(|_| "connection timeout".to_string())?
+    .map_err(|e| e.to_string())
 }
 
 /// Ping a remote volume server target by actually calling its Ping RPC (matches Go behavior).
@@ -5359,18 +5448,7 @@ async fn ping_volume_server_target(
     target: &str,
     tls: Option<&super::grpc_client::OutgoingGrpcTlsConfig>,
 ) -> Result<i64, String> {
-    let endpoint = to_grpc_endpoint(target, tls)?;
-    let channel = tokio::time::timeout(std::time::Duration::from_secs(5), endpoint.connect())
-        .await
-        .map_err(|_| "connection timeout".to_string())?
-        .map_err(|e| e.to_string())?;
-
-    let mut client = volume_server_pb::volume_server_client::VolumeServerClient::with_interceptor(
-        channel,
-        super::request_id::outgoing_request_id_interceptor,
-    )
-    .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE)
-    .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE);
+    let mut client = volume_server_client(connect_ping_target(target, tls).await?);
     let resp = client
         .ping(volume_server_pb::PingRequest {
             target: String::new(),
@@ -5386,18 +5464,7 @@ async fn ping_master_target(
     target: &str,
     tls: Option<&super::grpc_client::OutgoingGrpcTlsConfig>,
 ) -> Result<i64, String> {
-    let endpoint = to_grpc_endpoint(target, tls)?;
-    let channel = tokio::time::timeout(std::time::Duration::from_secs(5), endpoint.connect())
-        .await
-        .map_err(|_| "connection timeout".to_string())?
-        .map_err(|e| e.to_string())?;
-
-    let mut client = master_pb::seaweed_client::SeaweedClient::with_interceptor(
-        channel,
-        super::request_id::outgoing_request_id_interceptor,
-    )
-    .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE)
-    .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE);
+    let mut client = master_client(connect_ping_target(target, tls).await?);
     let resp = client
         .ping(master_pb::PingRequest {
             target: String::new(),
@@ -5413,18 +5480,7 @@ async fn ping_filer_target(
     target: &str,
     tls: Option<&super::grpc_client::OutgoingGrpcTlsConfig>,
 ) -> Result<i64, String> {
-    let endpoint = to_grpc_endpoint(target, tls)?;
-    let channel = tokio::time::timeout(std::time::Duration::from_secs(5), endpoint.connect())
-        .await
-        .map_err(|_| "connection timeout".to_string())?
-        .map_err(|e| e.to_string())?;
-
-    let mut client = filer_pb::seaweed_filer_client::SeaweedFilerClient::with_interceptor(
-        channel,
-        super::request_id::outgoing_request_id_interceptor,
-    )
-    .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE)
-    .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE);
+    let mut client = filer_client(connect_ping_target(target, tls).await?);
     let resp = client
         .ping(filer_pb::PingRequest::default())
         .await
@@ -5501,31 +5557,56 @@ async fn drain_copy_stream_to_file(
     }
 }
 
+/// One file of a volume copy: what to ask the source for and where it lands.
+#[derive(Clone, Copy)]
+struct CopyFileSpec<'a> {
+    is_ec_volume: bool,
+    collection: &'a str,
+    volume_id: u32,
+    compaction_revision: u32,
+    stop_offset: u64,
+    dest_path: &'a str,
+    ext: &'a str,
+    is_append: bool,
+    ignore_source_not_found: bool,
+    /// Whether this file's bytes are reported back to the caller as progress.
+    report_progress: bool,
+}
+
+/// Progress reporting and throttling shared by every file of one volume copy.
+struct CopyProgress<'a> {
+    tx: &'a tokio::sync::mpsc::Sender<Result<volume_server_pb::VolumeCopyResponse, Status>>,
+    next_report_target: &'a mut i64,
+    report_interval: i64,
+    throttler: &'a mut WriteThrottler,
+}
+
 /// Copy a file from a remote volume server via CopyFile streaming RPC.
 /// Returns the modified_ts_ns received from the source.
 async fn copy_file_from_source<T>(
     client: &mut volume_server_pb::volume_server_client::VolumeServerClient<T>,
-    is_ec_volume: bool,
-    collection: &str,
-    volume_id: u32,
-    compaction_revision: u32,
-    stop_offset: u64,
-    dest_path: &str,
-    ext: &str,
-    is_append: bool,
-    ignore_source_not_found: bool,
-    progress_tx: &tokio::sync::mpsc::Sender<Result<volume_server_pb::VolumeCopyResponse, Status>>,
-    report_progress: bool,
-    next_report_target: &mut i64,
-    report_interval: i64,
-    throttler: &mut WriteThrottler,
+    spec: &CopyFileSpec<'_>,
+    progress: &mut CopyProgress<'_>,
 ) -> Result<i64, Status>
 where
-    T: tonic::client::GrpcService<tonic::body::BoxBody>,
+    T: tonic::client::GrpcService<tonic::body::Body>,
     T::Error: Into<tonic::codegen::StdError>,
     T::ResponseBody: http_body::Body<Data = bytes::Bytes> + Send + 'static,
     <T::ResponseBody as http_body::Body>::Error: Into<tonic::codegen::StdError> + Send,
 {
+    let CopyFileSpec {
+        is_ec_volume,
+        collection,
+        volume_id,
+        compaction_revision,
+        stop_offset,
+        dest_path,
+        ext,
+        is_append,
+        ignore_source_not_found,
+        report_progress,
+    } = *spec;
+    let progress_tx = progress.tx;
     let copy_req = volume_server_pb::CopyFileRequest {
         volume_id,
         ext: ext.to_string(),
@@ -5619,11 +5700,11 @@ where
             // A throttled copy sleeps seconds at a time; wake for a departing
             // caller instead of finishing the nap first.
             tokio::select! {
-                _ = throttler.maybe_slowdown(resp.file_content.len() as i64) => {}
+                _ = progress.throttler.maybe_slowdown(resp.file_content.len() as i64) => {}
                 _ = progress_tx.closed() => return Err(cancelled()),
             }
 
-            if report_progress && progressed_bytes > *next_report_target {
+            if report_progress && progressed_bytes > *progress.next_report_target {
                 // Go aborts the transfer when this send fails
                 // (volume_grpc_copy.go: `return false`); so do we.
                 if progress_tx
@@ -5636,7 +5717,7 @@ where
                 {
                     return Err(cancelled());
                 }
-                *next_report_target = progressed_bytes + report_interval;
+                *progress.next_report_target = progressed_bytes + progress.report_interval;
             }
         }
     }
@@ -5727,10 +5808,152 @@ fn find_last_append_at_ns(idx_path: &str, dat_path: &str, version: u32) -> Optio
     let ts = u64::from_be_bytes([
         tail[4], tail[5], tail[6], tail[7], tail[8], tail[9], tail[10], tail[11],
     ]);
-    if ts > 0 {
-        Some(ts)
-    } else {
-        None
+    if ts > 0 { Some(ts) } else { None }
+}
+
+/// What one `volume_tail_sender` pass did.
+enum TailPass {
+    /// The volume is no longer mounted: the stream ends.
+    VolumeGone,
+    /// The receiver hung up: the stream ends without a status.
+    ClientGone,
+    /// The pass failed: the stream ends with this internal error.
+    Failed(String),
+    /// Nothing is newer than the caller's timestamp, and nothing was scanned.
+    CaughtUp,
+    /// A scan ran. `last_processed_ns` is the newest timestamp shipped, or the
+    /// caller's own when nothing was.
+    Scanned {
+        last_processed_ns: u64,
+        sent_any: bool,
+    },
+}
+
+/// One pass of `volume_tail_sender`, on a blocking thread: resolve where to
+/// start under one store guard, then stream every needle newer than
+/// `last_timestamp_ns` with the guard released.
+fn tail_pass(
+    state: &VolumeServerState,
+    vid: VolumeId,
+    sb_size: u64,
+    version: u32,
+    last_timestamp_ns: u64,
+    tx: &tokio::sync::mpsc::Sender<Result<volume_server_pb::VolumeTailSenderResponse, Status>>,
+) -> TailPass {
+    const BUFFER_SIZE_LIMIT: usize = 2 * 1024 * 1024;
+
+    // `is_last` means the client is already caught up: nothing in the
+    // volume is newer than last_timestamp_ns. Go answers that with a
+    // heartbeat and does NOT scan (volume_grpc_tail.go, `if isLastOne`).
+    // Dropping that flag here is expensive, not just untidy: the scan
+    // below reads every needle from its start offset to the end bound, and
+    // when the search yields offset 0 the start offset falls back to
+    // sb_size -- the whole volume. A volume being moved is marked
+    // read-only first, so it is ALWAYS caught up, and the tail loop
+    // would re-read and discard the entire volume every 2s until the
+    // idle timeout expired. Measured at ~2.17 GB re-read six times in
+    // 35s for a 2.15 GB volume, which OOM-kills the source under a
+    // per-process memory cap.
+    //
+    // The start offset, the .dat handle and the end bound are captured under
+    // ONE store read guard, and the guard is dropped before any needle is
+    // read. The handle pins the inode the offset was resolved against: a
+    // vacuum commit replaces .dat by rename, and unmount or destroy unlink it,
+    // so the offset stays meaningful after either (see DatScanPlan). Reading
+    // needles under the guard stalled the node: needle writes and the
+    // heartbeat take store.write(), and the lock prefers writers, so every
+    // reader queued behind them until the scan finished.
+    let (plan, from) = {
+        let store = state.store.read().unwrap();
+        let Some((_, vol)) = store.find_volume(vid) else {
+            return TailPass::VolumeGone;
+        };
+        let from = if last_timestamp_ns > 0 {
+            match vol.binary_search_by_append_at_ns(last_timestamp_ns) {
+                Ok((_, true)) => return TailPass::CaughtUp,
+                Ok((offset, false)) => {
+                    if offset.is_zero() {
+                        sb_size
+                    } else {
+                        offset.to_actual_offset() as u64
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("fail to locate by appendAtNs {}: {}", last_timestamp_ns, e);
+                    return TailPass::Failed(format!(
+                        "fail to locate by appendAtNs {}: {}",
+                        last_timestamp_ns, e
+                    ));
+                }
+            }
+        } else {
+            // No timestamp yet: the caller wants everything.
+            sb_size
+        };
+        match vol.dat_scan_plan(from) {
+            Ok(plan) => (plan, from),
+            Err(e) => {
+                return TailPass::Failed(format!(
+                    "streamFollow: scan volume {} from offset {}: {}",
+                    vid, from, e
+                ));
+            }
+        }
+    };
+
+    let mut last_processed_ns = last_timestamp_ns;
+    let mut sent_any = false;
+    let mut client_gone = false;
+    let scanned = plan.scan(|needle| {
+        // Notice a receiver that hung up between sends too, so a pass over
+        // needles it already has does not read on for nobody.
+        if tx.is_closed() {
+            client_gone = true;
+            return ControlFlow::Break(());
+        }
+        if needle.append_at_ns <= last_timestamp_ns && last_timestamp_ns > 0 {
+            return ControlFlow::Continue(());
+        }
+        sent_any = true;
+        // Send body in chunks of BUFFER_SIZE_LIMIT
+        // Go sends needle_header on every chunk
+        let mut i = 0;
+        while i < needle.body.len() {
+            let end = std::cmp::min(i + BUFFER_SIZE_LIMIT, needle.body.len());
+            let msg = volume_server_pb::VolumeTailSenderResponse {
+                needle_header: needle.header.to_vec(),
+                needle_body: needle.body[i..end].to_vec(),
+                is_last_chunk: end >= needle.body.len(),
+                version,
+            };
+            if tx.blocking_send(Ok(msg)).is_err() {
+                client_gone = true;
+                return ControlFlow::Break(());
+            }
+            i = end;
+        }
+        if needle.append_at_ns > last_processed_ns {
+            last_processed_ns = needle.append_at_ns;
+        }
+        ControlFlow::Continue(())
+    });
+
+    if client_gone {
+        return TailPass::ClientGone;
+    }
+    match scanned {
+        Ok(()) => TailPass::Scanned {
+            last_processed_ns,
+            sent_any,
+        },
+        // Streaming makes a failed pass partial: some needles may already be
+        // on the wire. Ending the stream cleanly would let the receiver
+        // (volume.move) treat a truncated tail as complete, so report it, as
+        // Go does (`streamFollow: %w`).
+        Err(e) => TailPass::Failed(format!(
+            "streamFollow: scan volume {} from offset {}: {}",
+            vid, from, e
+        )),
     }
 }
 
@@ -5759,8 +5982,9 @@ fn get_disk_usage(path: &str) -> (u64, u64) {
 mod tests {
     use super::*;
     use crate::config::MinFreeSpace;
-    use crate::remote_storage::s3_tier::{global_s3_tier_registry, S3TierBackend, S3TierConfig};
+    use crate::remote_storage::s3_tier::{S3TierBackend, S3TierConfig, global_s3_tier_registry};
     use crate::security::{Guard, SigningKey};
+    use crate::server::grpc_client::GRPC_MAX_MESSAGE_SIZE;
     use crate::storage::needle_map::NeedleMapKind;
     use crate::storage::store::Store;
     use std::sync::RwLock;
@@ -5928,9 +6152,9 @@ mod tests {
         tokio::sync::oneshot::Sender<()>,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
-        use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
-        use axum::routing::any;
         use axum::Router;
+        use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+        use axum::routing::any;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let body = Arc::new(body);
@@ -5959,41 +6183,40 @@ mod tests {
                         if let Some(range) = headers
                             .get(header::RANGE)
                             .and_then(|value| value.to_str().ok())
+                            && let Some(range_value) = range.strip_prefix("bytes=")
                         {
-                            if let Some(range_value) = range.strip_prefix("bytes=") {
-                                let mut parts = range_value.splitn(2, '-');
-                                let start = parts
-                                    .next()
-                                    .and_then(|value| value.parse::<usize>().ok())
-                                    .unwrap_or(0);
-                                let end = parts
-                                    .next()
-                                    .and_then(|value| value.parse::<usize>().ok())
-                                    .unwrap_or_else(|| bytes.len().saturating_sub(1));
-                                let start = start.min(bytes.len());
-                                let end = end.min(bytes.len().saturating_sub(1));
-                                let payload = if start > end || start >= bytes.len() {
-                                    Vec::new()
-                                } else {
-                                    bytes[start..=end].to_vec()
-                                };
-                                let mut response_headers = HeaderMap::new();
-                                response_headers.insert(
-                                    header::CONTENT_RANGE,
-                                    HeaderValue::from_str(&format!(
-                                        "bytes {}-{}/{}",
-                                        start,
-                                        end,
-                                        bytes.len()
-                                    ))
-                                    .unwrap(),
-                                );
-                                response_headers.insert(
-                                    header::CONTENT_LENGTH,
-                                    HeaderValue::from_str(&payload.len().to_string()).unwrap(),
-                                );
-                                return (StatusCode::PARTIAL_CONTENT, response_headers, payload);
-                            }
+                            let mut parts = range_value.splitn(2, '-');
+                            let start = parts
+                                .next()
+                                .and_then(|value| value.parse::<usize>().ok())
+                                .unwrap_or(0);
+                            let end = parts
+                                .next()
+                                .and_then(|value| value.parse::<usize>().ok())
+                                .unwrap_or_else(|| bytes.len().saturating_sub(1));
+                            let start = start.min(bytes.len());
+                            let end = end.min(bytes.len().saturating_sub(1));
+                            let payload = if start > end || start >= bytes.len() {
+                                Vec::new()
+                            } else {
+                                bytes[start..=end].to_vec()
+                            };
+                            let mut response_headers = HeaderMap::new();
+                            response_headers.insert(
+                                header::CONTENT_RANGE,
+                                HeaderValue::from_str(&format!(
+                                    "bytes {}-{}/{}",
+                                    start,
+                                    end,
+                                    bytes.len()
+                                ))
+                                .unwrap(),
+                            );
+                            response_headers.insert(
+                                header::CONTENT_LENGTH,
+                                HeaderValue::from_str(&payload.len().to_string()).unwrap(),
+                            );
+                            return (StatusCode::PARTIAL_CONTENT, response_headers, payload);
                         }
 
                         let mut response_headers = HeaderMap::new();
@@ -6038,13 +6261,9 @@ mod tests {
             let mut volume = crate::storage::volume::Volume::new(
                 dir,
                 dir,
-                "",
                 VolumeId(1),
                 NeedleMapKind::InMemory,
-                None,
-                None,
-                0,
-                Version::current(),
+                &crate::storage::volume::VolumeSpec::default(),
             )
             .unwrap();
             let mut needle = Needle {
@@ -6148,16 +6367,6 @@ mod tests {
             pre_stop_seconds: 0,
             volume_state_notify: tokio::sync::Notify::new(),
             write_queue: std::sync::OnceLock::new(),
-            s3_tier_registry: std::sync::RwLock::new({
-                // The tier-down handler resolves the backend from the per-server
-                // registry, so register it here too (reads use the global one).
-                let mut reg = crate::remote_storage::s3_tier::S3TierRegistry::new();
-                reg.register(
-                    format!("s3.{}", backend_id),
-                    S3TierBackend::new(&tier_config),
-                );
-                reg
-            }),
             read_mode: crate::config::ReadMode::Local,
             allow_untrusted_remote_endpoints: false,
             master_url: String::new(),
@@ -6194,6 +6403,14 @@ mod tests {
         collection: &str,
         ttl: Option<crate::storage::needle::ttl::TTL>,
     ) -> (VolumeGrpcService, TempDir) {
+        make_local_service_with_volume_and_trust(collection, ttl, true)
+    }
+
+    fn make_local_service_with_volume_and_trust(
+        collection: &str,
+        ttl: Option<crate::storage::needle::ttl::TTL>,
+        allow_untrusted: bool,
+    ) -> (VolumeGrpcService, TempDir) {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_str().unwrap();
 
@@ -6211,12 +6428,12 @@ mod tests {
         store
             .add_volume(
                 VolumeId(1),
-                collection,
-                None,
-                ttl,
-                0,
                 DiskType::HardDrive,
-                Version::current(),
+                &VolumeSpec {
+                    collection,
+                    ttl,
+                    ..Default::default()
+                },
             )
             .unwrap();
         {
@@ -6261,11 +6478,8 @@ mod tests {
             pre_stop_seconds: 0,
             volume_state_notify: tokio::sync::Notify::new(),
             write_queue: std::sync::OnceLock::new(),
-            s3_tier_registry: std::sync::RwLock::new(
-                crate::remote_storage::s3_tier::S3TierRegistry::new(),
-            ),
             read_mode: crate::config::ReadMode::Local,
-            allow_untrusted_remote_endpoints: false,
+            allow_untrusted_remote_endpoints: allow_untrusted,
             master_url: String::new(),
             master_urls: Vec::new(),
             seed_master_set: std::collections::HashSet::new(),
@@ -6290,6 +6504,36 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_copy_and_tail_handlers_reject_blocked_sources() {
+        let (service, _tmp) = make_local_service_with_volume_and_trust("guard_rpc", None, false);
+
+        let copy_req = Request::new(volume_server_pb::VolumeCopyRequest {
+            volume_id: 1,
+            source_data_node: "169.254.169.254:80".to_string(),
+            ..Default::default()
+        });
+        let status = service.volume_copy(copy_req).await.err().unwrap();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{}", status);
+
+        let tail_req = Request::new(volume_server_pb::VolumeTailReceiverRequest {
+            volume_id: 1,
+            source_volume_server: "127.0.0.1:8080".to_string(),
+            ..Default::default()
+        });
+        let status = service.volume_tail_receiver(tail_req).await.err().unwrap();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{}", status);
+
+        let ec_req = Request::new(volume_server_pb::VolumeEcShardsCopyRequest {
+            volume_id: 1,
+            source_data_node: "127.0.0.1:8080".to_string(),
+            shard_ids: vec![0],
+            ..Default::default()
+        });
+        let status = service.volume_ec_shards_copy(ec_req).await.err().unwrap();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{}", status);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_volume_consolidate_index_rpc() {
         let (service, _tmp) = make_local_service_with_volume("consolidate_rpc", None);
 
@@ -6311,6 +6555,30 @@ mod tests {
         let store = service.state.store.read().unwrap();
         let (_, v) = store.find_volume(VolumeId(1)).unwrap();
         assert_eq!(v.file_count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_vacuum_volume_commit_missing_volume_is_not_found() {
+        let (service, _tmp) = make_local_service_with_volume("vacuum_commit_missing", None);
+
+        let mut request =
+            Request::new(volume_server_pb::VacuumVolumeCommitRequest { volume_id: 4242 });
+        request
+            .extensions_mut()
+            .insert(tonic::transport::server::TcpConnectInfo {
+                local_addr: None,
+                remote_addr: Some("127.0.0.1:65000".parse().unwrap()),
+            });
+
+        let err = service
+            .vacuum_volume_commit(request)
+            .await
+            .expect_err("committing a compaction for a volume that is not mounted must fail");
+        assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
+        assert!(
+            err.message().contains("4242"),
+            "the message must still name the volume: {err:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6373,8 +6641,8 @@ mod tests {
         {
             let store = service.state.store.read().unwrap();
             let (_, vol) = store.find_volume(VolumeId(1)).unwrap();
-            assert!(!vol.has_remote_file);
-            assert!(vol.volume_info.files.is_empty());
+            assert!(!vol.has_remote_file());
+            assert!(vol.volume_info().files.is_empty());
             assert!(vol.has_data_backend());
         }
 
@@ -6457,10 +6725,10 @@ mod tests {
             let store = service.state.store.read().unwrap();
             let (_, vol) = store.find_volume(VolumeId(1)).unwrap();
             assert!(
-                vol.has_remote_file,
+                vol.has_remote_file(),
                 "abandoned tier-down published the transition to local"
             );
-            assert!(!vol.volume_info.files.is_empty());
+            assert!(!vol.volume_info().files.is_empty());
         }
         assert_eq!(
             delete_count.load(std::sync::atomic::Ordering::SeqCst),
@@ -6504,8 +6772,8 @@ mod tests {
         {
             let store = service.state.store.read().unwrap();
             let (_, vol) = store.find_volume(VolumeId(1)).unwrap();
-            assert!(!vol.has_remote_file);
-            assert!(vol.volume_info.files.is_empty());
+            assert!(!vol.has_remote_file());
+            assert!(vol.volume_info().files.is_empty());
             assert!(vol.has_data_backend());
         }
 
@@ -6517,6 +6785,64 @@ mod tests {
             .write()
             .unwrap()
             .remove("s3.tier_down_keep");
+    }
+
+    // The tier-up handler has no end-to-end test — exercising it needs a fake
+    // S3 that accepts multipart uploads — so this probes only the part that
+    // changed: the destination is resolved from the process-wide registry, now
+    // the only one. A backend registered nowhere else has to get past that
+    // lookup. The stream stays open until the spawned transfer reports its
+    // terminal error, so the task cannot race a dropped receiver or outlive
+    // the test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_tier_move_to_remote_resolves_the_destination_from_the_global_registry() {
+        let (service, _tmp) = make_local_service_with_volume("", None);
+        {
+            let mut registry = global_s3_tier_registry().write().unwrap();
+            registry.register(
+                "s3.tier_up_probe".to_string(),
+                S3TierBackend::new(&S3TierConfig {
+                    access_key: "access".to_string(),
+                    secret_key: "secret".to_string(),
+                    region: "us-east-1".to_string(),
+                    bucket: "bucket-a".to_string(),
+                    // Nothing listens here; the upload fails instead of hanging.
+                    endpoint: "http://127.0.0.1:1".to_string(),
+                    storage_class: "STANDARD".to_string(),
+                    force_path_style: true,
+                }),
+            );
+        }
+
+        let mut stream = service
+            .volume_tier_move_dat_to_remote(Request::new(
+                volume_server_pb::VolumeTierMoveDatToRemoteRequest {
+                    volume_id: 1,
+                    collection: String::new(),
+                    destination_backend_name: "s3.tier_up_probe".to_string(),
+                    keep_local_dat_file: true,
+                },
+            ))
+            .await
+            .expect("tier-up must resolve its destination from the global registry")
+            .into_inner();
+
+        // The dead endpoint fails the multipart upload; the terminal error is
+        // also what proves the spawned task ran to completion rather than
+        // leaving background network work behind.
+        let terminal = stream.next().await;
+        global_s3_tier_registry()
+            .write()
+            .unwrap()
+            .remove("s3.tier_up_probe");
+
+        match terminal {
+            Some(Err(status)) => {
+                assert_eq!(status.code(), tonic::Code::Internal, "{status:?}");
+                assert!(status.message().contains("s3.tier_up_probe"), "{status:?}");
+            }
+            other => panic!("the dead endpoint must fail the upload, got {other:?}"),
+        }
     }
 
     /// Build a local service whose volume has a `.dat` large enough to span
@@ -6609,20 +6935,24 @@ mod tests {
         let mut throttler = WriteThrottler::new(0);
         let err = copy_file_from_source(
             &mut client,
-            false,
-            "",
-            1,
-            u32::MAX,
-            dat_bytes.len() as u64,
-            &dest_path,
-            ".dat",
-            false,
-            true,
-            &tx,
-            true,
-            &mut next_report_target,
-            128 * 1024 * 1024,
-            &mut throttler,
+            &CopyFileSpec {
+                is_ec_volume: false,
+                collection: "",
+                volume_id: 1,
+                compaction_revision: u32::MAX,
+                stop_offset: dat_bytes.len() as u64,
+                dest_path: &dest_path,
+                ext: ".dat",
+                is_append: false,
+                ignore_source_not_found: true,
+                report_progress: true,
+            },
+            &mut CopyProgress {
+                tx: &tx,
+                next_report_target: &mut next_report_target,
+                report_interval: 128 * 1024 * 1024,
+                throttler: &mut throttler,
+            },
         )
         .await
         .expect_err("a copy whose caller is gone must not run to completion");
@@ -6733,7 +7063,77 @@ mod tests {
     // delete_volume. Without the lock seam the task sees is_closed() at its
     // very first check and returns before mount_volume, exercising the wrong
     // path — the test would be green for the wrong reason.
+    /// ReceiveFile had no test at all, which is how a `write()` whose short
+    /// return was counted as success survived. This drives the real streaming
+    /// handler over a real connection with chunks that do not divide evenly,
+    /// and checks the bytes on disk rather than just the reported count -- a
+    /// dropped or reordered chunk changes the file even when `bytes_written`
+    /// still adds up.
+    #[tokio::test]
+    async fn receive_file_writes_every_chunk_and_reports_the_full_length() {
+        let (service, tmp) = make_local_service_with_volume("", None);
+        let dir = tmp.path().to_str().unwrap().to_string();
+        let (port, _shutdown) = serve_source(service).await;
+
+        let mut client = volume_server_pb::volume_server_client::VolumeServerClient::connect(
+            format!("http://127.0.0.1:{}", port),
+        )
+        .await
+        .unwrap();
+
+        // Deliberately ragged chunk sizes, and a payload whose bytes are
+        // position-dependent so any shift is visible.
+        let payload: Vec<u8> = (0..70_001u32).map(|i| (i % 251) as u8).collect();
+        let mut messages = vec![volume_server_pb::ReceiveFileRequest {
+            data: Some(volume_server_pb::receive_file_request::Data::Info(
+                volume_server_pb::ReceiveFileInfo {
+                    volume_id: 1,
+                    ext: ".recv_test".to_string(),
+                    collection: String::new(),
+                    is_ec_volume: false,
+                    shard_id: 0,
+                    file_size: payload.len() as u64,
+                    disk_type: String::new(),
+                    disk_id: 0,
+                },
+            )),
+        }];
+        for chunk in payload.chunks(7_777) {
+            messages.push(volume_server_pb::ReceiveFileRequest {
+                data: Some(volume_server_pb::receive_file_request::Data::FileContent(
+                    chunk.to_vec(),
+                )),
+            });
+        }
+
+        let response = client
+            .receive_file(tokio_stream::iter(messages))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.error, "", "ReceiveFile reported an error");
+        assert_eq!(
+            response.bytes_written,
+            payload.len() as u64,
+            "bytes_written must cover the whole payload"
+        );
+
+        let written = std::fs::read(format!("{}/1.recv_test", dir)).unwrap();
+        assert_eq!(
+            written.len(),
+            payload.len(),
+            "file on disk is a different length than the payload"
+        );
+        assert_eq!(written, payload, "file on disk does not match the payload");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[expect(
+        clippy::await_holding_lock,
+        clippy::readonly_write_lock,
+        reason = "the store write guard is a barrier that parks the copy task at the mount block"
+    )]
     async fn test_volume_copy_after_mount_cancellation_rolls_back_mount() {
         let (source_service, _source_tmp, _dat_bytes) = make_local_service_with_large_volume();
         let (port, _shutdown) = serve_source(source_service).await;
@@ -6840,6 +7240,76 @@ mod tests {
             .flat_map(|m| m.file_content.clone())
             .collect();
         assert_eq!(copied, dat_bytes);
+    }
+
+    // volume_tail_sender streams each needle in 2MB chunks with the header on
+    // every chunk, heartbeats once the caller is caught up, and ends when the
+    // idle timeout runs out. Reassembling the stream must reproduce the .dat
+    // after the superblock byte for byte, so a scan that skipped, reordered or
+    // re-sent a record fails here. The fixture holds a small needle and a 5MB
+    // one, covering the single- and multi-chunk paths.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_volume_tail_sender_streams_chunks_then_heartbeats() {
+        let (service, _tmp, dat_bytes) = make_local_service_with_large_volume();
+        let sb_size = {
+            let store = service.state.store.read().unwrap();
+            let (_, v) = store.find_volume(VolumeId(1)).unwrap();
+            v.super_block.block_size()
+        };
+
+        let response = service
+            .volume_tail_sender(Request::new(volume_server_pb::VolumeTailSenderRequest {
+                volume_id: 1,
+                since_ns: 0,
+                idle_timeout_seconds: 1,
+            }))
+            .await
+            .unwrap();
+        let mut stream = response.into_inner();
+        let messages = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut messages = Vec::new();
+            while let Some(m) = stream.next().await {
+                messages.push(m.unwrap());
+            }
+            messages
+        })
+        .await
+        .expect("the tail must end once its idle timeout runs out");
+
+        let (heartbeats, chunks): (Vec<_>, Vec<_>) =
+            messages.iter().partition(|m| m.needle_header.is_empty());
+        assert_eq!(heartbeats.len(), 1, "one caught-up pass before the timeout");
+        assert!(heartbeats[0].is_last_chunk && heartbeats[0].needle_body.is_empty());
+        assert!(
+            messages.last().unwrap().needle_header.is_empty(),
+            "the heartbeat follows the data"
+        );
+
+        let mut shipped = Vec::new();
+        let mut ids = Vec::new();
+        let mut chunks_per_needle = Vec::new();
+        let mut current_header: Vec<u8> = Vec::new();
+        let mut starting = true;
+        for m in &chunks {
+            if starting {
+                current_header = m.needle_header.clone();
+                shipped.extend_from_slice(&current_header);
+                ids.push(Needle::parse_header(&current_header).1);
+                chunks_per_needle.push(0);
+            } else {
+                assert_eq!(m.needle_header, current_header, "header on every chunk");
+            }
+            shipped.extend_from_slice(&m.needle_body);
+            *chunks_per_needle.last_mut().unwrap() += 1;
+            starting = m.is_last_chunk;
+        }
+        assert!(starting, "the last needle must end on is_last_chunk");
+        assert_eq!(ids, vec![NeedleId(11), NeedleId(99)]);
+        assert_eq!(chunks_per_needle, vec![1, 3], "a 5MB body in 2MB chunks");
+        assert!(
+            shipped == dat_bytes[sb_size..],
+            "the stream must reproduce the .dat after the superblock"
+        );
     }
 
     // copy_file must stop exactly at stop_offset, never streaming past it.
@@ -6962,9 +7432,6 @@ mod tests {
             pre_stop_seconds: 0,
             volume_state_notify: tokio::sync::Notify::new(),
             write_queue: std::sync::OnceLock::new(),
-            s3_tier_registry: std::sync::RwLock::new(
-                crate::remote_storage::s3_tier::S3TierRegistry::new(),
-            ),
             read_mode: crate::config::ReadMode::Local,
             allow_untrusted_remote_endpoints: false,
             master_url: master_urls.first().cloned().unwrap_or_default(),
@@ -7108,6 +7575,53 @@ mod tests {
             .await;
         if let Err(err) = result {
             assert_ne!(err.code(), tonic::Code::InvalidArgument, "got {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_needle_blob_negative_returns_invalid_argument() {
+        let (service, _tmp) = make_local_service_with_volume("", None);
+        let err = service
+            .read_needle_blob(Request::new(volume_server_pb::ReadNeedleBlobRequest {
+                volume_id: 1,
+                offset: 0,
+                size: -100,
+            }))
+            .await
+            .expect_err("negative size must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_write_needle_blob_negative_returns_invalid_argument() {
+        let (service, _tmp) = make_local_service_with_volume("", None);
+        let err = service
+            .write_needle_blob(Request::new(volume_server_pb::WriteNeedleBlobRequest {
+                volume_id: 1,
+                needle_id: 11,
+                size: -100,
+                needle_blob: vec![],
+            }))
+            .await
+            .expect_err("negative size must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_read_needle_blob_zero_size_passes_gate() {
+        let (service, _tmp) = make_local_service_with_volume("", None);
+        // Size(0) must pass the wire-size gate (may 404/Internal downstream,
+        // but must NOT be rejected as InvalidArgument).
+        match service
+            .read_needle_blob(Request::new(volume_server_pb::ReadNeedleBlobRequest {
+                volume_id: 1,
+                offset: 0,
+                size: 0,
+            }))
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => assert_ne!(e.code(), tonic::Code::InvalidArgument, "got {e:?}"),
         }
     }
 
@@ -7413,11 +7927,11 @@ mod tests {
         {
             let store = service.state.store.read().unwrap();
             let ecv = store.find_ec_volume(VolumeId(1)).unwrap();
-            let mut locs = ecv.shard_locations.write().unwrap();
-            for sid in 0u8..14 {
-                locs.insert(sid, vec!["127.0.0.1:255.1".to_string()]);
-            }
-            *ecv.shard_locations_refresh_time.lock().unwrap() = Some(std::time::Instant::now());
+            ecv.merge_shard_locations(
+                (0u8..14)
+                    .map(|sid| (sid, vec!["127.0.0.1:255.1".to_string()]))
+                    .collect(),
+            );
         }
 
         // All shards local: FULL is clean.
@@ -7449,6 +7963,91 @@ mod tests {
         assert!(resp.broken_shard_infos.iter().any(|s| s.shard_id == 0));
         assert!(resp.details.is_empty(), "{:?}", resp.details);
         assert_eq!(resp.total_files, 1);
+    }
+
+    /// Batch atomicity: mount pre-validates the ENTIRE shard_ids before
+    /// acquiring the write lock or mounting anything. A batch like [0, 32]
+    /// must fail with InvalidArgument and mount NOTHING — not the valid
+    /// prefix (shard 0). Regression test for the in-loop validation that
+    /// mounted 0 then returned InvalidArgument, skipping the sidecar reload
+    /// + notify.
+    #[tokio::test]
+    async fn test_mount_rejects_invalid_batch_without_partial_mutation() {
+        let (service, _tmp) = make_local_service_with_volume("", None);
+        service
+            .volume_ec_shards_generate(Request::new(
+                volume_server_pb::VolumeEcShardsGenerateRequest {
+                    volume_id: 1,
+                    collection: String::new(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let err = service
+            .volume_ec_shards_mount(Request::new(volume_server_pb::VolumeEcShardsMountRequest {
+                volume_id: 1,
+                collection: String::new(),
+                shard_ids: vec![0, 32],
+                source_disk_type: String::new(),
+                recover_missing_index: false,
+            }))
+            .await
+            .expect_err("batch with shard 32 must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{}", err);
+
+        // No partial mutation: shard 0 must NOT be mounted.
+        let store = service.state.store.read().unwrap();
+        assert!(
+            store.find_ec_volume_with_shard(VolumeId(1), 0).is_none(),
+            "invalid batch must mount nothing, but shard 0 is mounted"
+        );
+    }
+
+    /// Batch atomicity (unmount side): unmount pre-validates the ENTIRE
+    /// shard_ids after admin auth but before the write lock / mutation. A
+    /// batch like [0, 32] must fail with InvalidArgument and unmount NOTHING.
+    #[tokio::test]
+    async fn test_unmount_rejects_invalid_batch_without_partial_mutation() {
+        let (service, _tmp) = make_local_service_with_volume("", None);
+        service
+            .volume_ec_shards_generate(Request::new(
+                volume_server_pb::VolumeEcShardsGenerateRequest {
+                    volume_id: 1,
+                    collection: String::new(),
+                },
+            ))
+            .await
+            .unwrap();
+        service
+            .volume_ec_shards_mount(Request::new(volume_server_pb::VolumeEcShardsMountRequest {
+                volume_id: 1,
+                collection: String::new(),
+                shard_ids: (0..14).collect(),
+                source_disk_type: String::new(),
+                recover_missing_index: false,
+            }))
+            .await
+            .unwrap();
+
+        let err = service
+            .volume_ec_shards_unmount(Request::new(
+                volume_server_pb::VolumeEcShardsUnmountRequest {
+                    volume_id: 1,
+                    shard_ids: vec![0, 32],
+                    encode_ts_ns: 0,
+                },
+            ))
+            .await
+            .expect_err("batch with shard 32 must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{}", err);
+
+        // No partial mutation: shard 0 must STILL be mounted.
+        let store = service.state.store.read().unwrap();
+        assert!(
+            store.find_ec_volume_with_shard(VolumeId(1), 0).is_some(),
+            "invalid unmount batch must unmount nothing, but shard 0 is gone"
+        );
     }
 
     /// Two locations, one vid: the split-disk / cross-disk-reconcile layout
@@ -7684,9 +8283,6 @@ mod tests {
             pre_stop_seconds: 0,
             volume_state_notify: tokio::sync::Notify::new(),
             write_queue: std::sync::OnceLock::new(),
-            s3_tier_registry: std::sync::RwLock::new(
-                crate::remote_storage::s3_tier::S3TierRegistry::new(),
-            ),
             read_mode: crate::config::ReadMode::Local,
             allow_untrusted_remote_endpoints: false,
             master_url: String::new(),
@@ -7762,11 +8358,11 @@ mod tests {
     fn seed_all_shard_locations(service: &VolumeGrpcService, vid_raw: u32) {
         let store = service.state.store.read().unwrap();
         for ecv in store.find_all_ec_volumes(VolumeId(vid_raw)) {
-            let mut locs = ecv.shard_locations.write().unwrap();
-            for sid in 0u8..14 {
-                locs.insert(sid, vec!["127.0.0.1:255.1".to_string()]);
-            }
-            *ecv.shard_locations_refresh_time.lock().unwrap() = Some(std::time::Instant::now());
+            ecv.merge_shard_locations(
+                (0u8..14)
+                    .map(|sid| (sid, vec!["127.0.0.1:255.1".to_string()]))
+                    .collect(),
+            );
         }
     }
 
@@ -8039,13 +8635,9 @@ mod tests {
             let mut v = crate::storage::volume::Volume::new(
                 src_s,
                 src_s,
-                "",
                 vid,
                 NeedleMapKind::InMemory,
-                None,
-                None,
-                0,
-                crate::storage::types::Version::current(),
+                &crate::storage::volume::VolumeSpec::default(),
             )
             .unwrap();
             for i in 1..=8u64 {

@@ -24,6 +24,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
@@ -81,9 +82,9 @@ func (vs *VolumeServer) DeleteCollection(ctx context.Context, req *volume_server
 
 	if err != nil {
 		glog.Errorf("delete collection %s: %v", req.Collection, err)
-	} else {
-		glog.V(2).Infof("delete collection %v", req)
+		return resp, volumeStatusError(fmt.Errorf("delete collection %s: %w", req.Collection, err))
 	}
+	glog.V(2).Infof("delete collection %v", req)
 
 	return resp, err
 
@@ -201,7 +202,7 @@ func (vs *VolumeServer) VolumeDelete(ctx context.Context, req *volume_server_pb.
 
 	if err != nil {
 		glog.Errorf("volume delete %v: %v", req, err)
-		return resp, volumeDeleteStatusError(err)
+		return resp, volumeStatusError(err)
 	} else {
 		// V(0) so destructive RPCs are always traceable.
 		glog.Infof("volume delete %v", req)
@@ -211,15 +212,18 @@ func (vs *VolumeServer) VolumeDelete(ctx context.Context, req *volume_server_pb.
 
 }
 
-// volumeDeleteStatusError keeps the store's message so callers matching on
+// volumeStatusError keeps the store's message so callers matching on
 // "not found" or "volume not empty" keep working, and adds the status code so
 // new callers do not have to.
-func volumeDeleteStatusError(err error) error {
+func volumeStatusError(err error) error {
 	if errors.Is(err, storage.ErrVolumeNotFound) {
 		return status.Error(codes.NotFound, err.Error())
 	}
 	if errors.Is(err, storage.ErrVolumeNotEmpty) {
 		return status.Error(codes.FailedPrecondition, err.Error())
+	}
+	if errors.Is(err, storage.ErrInsufficientSpace) {
+		return status.Error(codes.ResourceExhausted, err.Error())
 	}
 	return err
 }
@@ -497,10 +501,13 @@ func (vs *VolumeServer) VolumeNeedleStatus(ctx context.Context, req *volume_serv
 		count, err = vs.store.ReadVolumeNeedle(volumeId, n, nil, nil)
 	}
 	if err != nil {
+		if errors.Is(err, storage.ErrorNotFound) || errors.Is(err, erasure_coding.NotFoundError) {
+			return nil, status.Errorf(codes.NotFound, "needle not found %d", n.Id)
+		}
 		return nil, err
 	}
 	if count < 0 {
-		return nil, fmt.Errorf("needle not found %d", n.Id)
+		return nil, status.Errorf(codes.NotFound, "needle not found %d", n.Id)
 	}
 
 	resp.NeedleId = uint64(n.Id)

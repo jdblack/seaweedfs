@@ -178,8 +178,8 @@ mod tests {
         use crate::server::volume_server::RuntimeMetricsConfig;
         use crate::storage::needle_map::NeedleMapKind;
         use crate::storage::store::Store;
-        use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32};
         use std::sync::RwLock;
+        use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32};
 
         let store = Store::new(NeedleMapKind::InMemory);
         let guard = Guard::new(&[], SigningKey(vec![]), 0, SigningKey(vec![]), 0);
@@ -207,9 +207,6 @@ mod tests {
             pre_stop_seconds: 0,
             volume_state_notify: tokio::sync::Notify::new(),
             write_queue: std::sync::OnceLock::new(),
-            s3_tier_registry: std::sync::RwLock::new(
-                crate::remote_storage::s3_tier::S3TierRegistry::new(),
-            ),
             read_mode: crate::config::ReadMode::Local,
             allow_untrusted_remote_endpoints: false,
             master_url: String::new(),

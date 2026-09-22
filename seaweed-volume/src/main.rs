@@ -6,19 +6,22 @@ use seaweed_volume::config::{self, VolumeServerConfig};
 use seaweed_volume::metrics;
 use seaweed_volume::pb::volume_server_pb::volume_server_server::VolumeServerServer;
 use seaweed_volume::security::tls::{
-    build_rustls_server_config, build_rustls_server_config_with_grpc_client_auth,
-    install_default_crypto_provider, GrpcClientAuthPolicy, TlsPolicy,
+    GrpcClientAuthPolicy, TlsPolicy, build_rustls_server_config,
+    build_rustls_server_config_with_grpc_client_auth, install_default_crypto_provider,
 };
 use seaweed_volume::security::{Guard, SigningKey};
 #[cfg(unix)]
 use seaweed_volume::server::debug::build_debug_router;
-use seaweed_volume::server::grpc_client::load_outgoing_grpc_tls;
+use seaweed_volume::server::grpc_client::{
+    GRPC_INITIAL_WINDOW_SIZE, GRPC_KEEPALIVE_INTERVAL, GRPC_KEEPALIVE_TIMEOUT,
+    GRPC_MAX_MESSAGE_SIZE, load_outgoing_grpc_tls,
+};
 use seaweed_volume::server::grpc_server::VolumeGrpcService;
 #[cfg(unix)]
 use seaweed_volume::server::profiling::CpuProfileSession;
 use seaweed_volume::server::request_id::GrpcRequestIdLayer;
 use seaweed_volume::server::volume_server::{
-    build_metrics_router, RuntimeMetricsConfig, VolumeServerState,
+    RuntimeMetricsConfig, VolumeServerState, build_metrics_router,
 };
 use seaweed_volume::server::write_queue::WriteQueue;
 use seaweed_volume::storage::store::Store;
@@ -31,10 +34,10 @@ type CpuProfileParam = Option<CpuProfileSession>;
 #[cfg(not(unix))]
 type CpuProfileParam = Option<()>;
 
-const GRPC_MAX_MESSAGE_SIZE: usize = 1 << 30;
-const GRPC_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-const GRPC_KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-const GRPC_INITIAL_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
+// The two settings that only make sense for the inbound server. The rest of
+// this server's HTTP/2 tuning — keepalive, window sizes, message size — is
+// imported from `server::grpc_client` above, which is also what the outgoing
+// clients dial with, so the two directions cannot drift apart.
 const GRPC_MAX_HEADER_LIST_SIZE: u32 = 8 * 1024 * 1024;
 const GRPC_MAX_CONCURRENT_STREAMS: u32 = 1000;
 
@@ -343,9 +346,6 @@ async fn run(
         pre_stop_seconds: config.pre_stop_seconds,
         volume_state_notify: tokio::sync::Notify::new(),
         write_queue: std::sync::OnceLock::new(),
-        s3_tier_registry: std::sync::RwLock::new(
-            seaweed_volume::remote_storage::s3_tier::S3TierRegistry::new(),
-        ),
         read_mode: config.read_mode,
         allow_untrusted_remote_endpoints: config.allow_untrusted_remote_endpoints,
         master_url,
@@ -671,8 +671,7 @@ async fn run(
                     })
                     .await
             } else {
-                let incoming =
-                    tokio_stream::wrappers::TcpListenerStream::new(grpc_listener);
+                let incoming = tokio_stream::wrappers::TcpListenerStream::new(grpc_listener);
                 info!("gRPC server listening on {}", grpc_local_addr);
                 build_grpc_server_builder()
                     .layer(GrpcRequestIdLayer)
@@ -1058,15 +1057,17 @@ mod tests {
 
     #[test]
     fn test_grpc_server_tls_returns_none_when_files_are_missing() {
-        assert!(build_grpc_server_tls_acceptor(
-            "/missing/server.crt",
-            "/missing/server.key",
-            "/missing/ca.crt",
-            &TlsPolicy::default(),
-            "",
-            &[],
-        )
-        .is_none());
+        assert!(
+            build_grpc_server_tls_acceptor(
+                "/missing/server.crt",
+                "/missing/server.key",
+                "/missing/ca.crt",
+                &TlsPolicy::default(),
+                "",
+                &[],
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1088,19 +1089,21 @@ mod tests {
             "-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n",
         );
 
-        assert!(build_grpc_server_tls_acceptor(
-            &cert,
-            &key,
-            &ca,
-            &TlsPolicy {
-                min_version: "TLS 1.0".to_string(),
-                max_version: "TLS 1.1".to_string(),
-                cipher_suites: String::new(),
-            },
-            "",
-            &[],
-        )
-        .is_none());
+        assert!(
+            build_grpc_server_tls_acceptor(
+                &cert,
+                &key,
+                &ca,
+                &TlsPolicy {
+                    min_version: "TLS 1.0".to_string(),
+                    max_version: "TLS 1.1".to_string(),
+                    cipher_suites: String::new(),
+                },
+                "",
+                &[],
+            )
+            .is_none()
+        );
     }
 
     #[test]

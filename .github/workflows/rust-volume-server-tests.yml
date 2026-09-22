@@ -5,6 +5,7 @@ on:
     branches: [ master ]
     paths:
       - 'seaweed-volume/**'
+      - 'seaweed-common/**'
       - 'test/volume_server/**'
       - 'weed/pb/volume_server.proto'
       - 'weed/pb/volume_server_pb/**'
@@ -13,6 +14,7 @@ on:
     branches: [ master, main ]
     paths:
       - 'seaweed-volume/**'
+      - 'seaweed-common/**'
       - 'test/volume_server/**'
       - 'weed/pb/volume_server.proto'
       - 'weed/pb/volume_server_pb/**'
@@ -27,6 +29,29 @@ permissions:
 
 
 jobs:
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Filter changed paths
+        id: filter
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            rust:
+              - 'seaweed-volume/**'
+              - '.github/workflows/rust-volume-server-tests.yml'
+
   rust-unit-tests:
     name: Rust Unit Tests
     runs-on: ubuntu-22.04
@@ -52,12 +77,72 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             seaweed-volume/target
-          key: rust-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('seaweed-volume/Cargo.lock') }}
+          key: rust-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('seaweed-volume/Cargo.lock', 'seaweed-common/Cargo.lock') }}
           restore-keys: |
             rust-${{ steps.toolchain.outputs.fingerprint }}-
 
       - name: Build Rust volume server
         run: cd seaweed-volume && cargo build --release
+
+      # The crate is warning-free under clippy as of the sweep that added
+      # this step. Uncomment to make that a gate; `[lints.clippy]` in
+      # seaweed-volume/Cargo.toml is where crate-wide exceptions live.
+      # - name: Clippy
+      #   run: cd seaweed-volume && cargo clippy --all-targets -- -D warnings
+
+      # The crate is rustfmt-clean as of the PR that added this step.
+      # Uncomment to keep it that way.
+      # - name: Check formatting
+      #   run: cd seaweed-volume && cargo fmt --check
+
+      # seaweed-common is a path dependency of this crate, not a member of its
+      # workspace, so the run below does not reach its own tests. It builds into
+      # this job's cached target directory, and the cache key above covers the
+      # shared crate's lock, so the aws-lc-sys that rustls pulls in is restored
+      # with the cache instead of compiled from scratch on every run.
+      - name: Run shared-crate unit tests
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/seaweed-volume/target
+        run: cd seaweed-common && cargo test
+
+      - name: Run Rust unit tests
+        run: cd seaweed-volume && cargo test
+
+      - name: Run Rust unit tests (redb experimental cursor)
+        run: cd seaweed-volume && cargo test --features redb-experimental-cursor --lib storage::needle_map
+
+  rust-unit-tests-windows:
+    name: Rust Unit Tests (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    needs: [changes]
+    if: needs.changes.outputs.rust == 'true'
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # No glibc on Windows: key the cache on the toolchain and OS only.
+      - name: Fingerprint build toolchain
+        id: toolchain
+        run: echo "fingerprint=windows-rustc-$(rustc -V | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            seaweed-volume/target
+          key: rust-windows-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('seaweed-volume/Cargo.lock') }}
+          restore-keys: |
+            rust-windows-${{ steps.toolchain.outputs.fingerprint }}-
 
       - name: Run Rust unit tests
         run: cd seaweed-volume && cargo test
@@ -95,7 +180,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             seaweed-volume/target
-          key: rust-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('seaweed-volume/Cargo.lock') }}
+          key: rust-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('seaweed-volume/Cargo.lock', 'seaweed-common/Cargo.lock') }}
           restore-keys: |
             rust-${{ steps.toolchain.outputs.fingerprint }}-
 
@@ -177,7 +262,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             seaweed-volume/target
-          key: rust-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('seaweed-volume/Cargo.lock') }}
+          key: rust-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('seaweed-volume/Cargo.lock', 'seaweed-common/Cargo.lock') }}
           restore-keys: |
             rust-${{ steps.toolchain.outputs.fingerprint }}-
 

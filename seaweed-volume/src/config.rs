@@ -1,8 +1,30 @@
 use clap::Parser;
+use std::ffi::OsString;
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 
 use crate::security::tls::TlsPolicy;
+
+/// How this module reads the environment.
+///
+/// Production passes [`process_env`]; tests pass a map. Injecting the lookup
+/// is what lets the tests cover `HOME` and the `WEED_*` overrides without
+/// `std::env::set_var`, which is `unsafe` in Rust 2024 because it races with
+/// every other thread in the process — and the lib test binary runs tokio
+/// runtimes, TLS stacks and AWS clients that read the environment lazily on
+/// threads no test mutex can reach.
+type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<OsString>;
+
+/// The real process environment, as an [`EnvLookup`].
+fn process_env(key: &str) -> Option<OsString> {
+    std::env::var_os(key)
+}
+
+/// `std::env::var`'s view of an [`EnvLookup`]: unset and non-UTF-8 both read
+/// as absent, exactly as `std::env::var(key).ok()` does.
+fn env_string(env: EnvLookup<'_>, key: &str) -> Option<String> {
+    env(key).and_then(|value| value.into_string().ok())
+}
 
 /// SeaweedFS Volume Server (Rust implementation)
 ///
@@ -334,7 +356,7 @@ pub fn parse_cli() -> VolumeServerConfig {
     let normalized = normalize_args_vec(args);
     let merged = merge_options_file(normalized);
     let cli = Cli::parse_from(merged);
-    resolve_config(cli)
+    resolve_config_with_env(cli, &process_env)
 }
 
 /// Find `-options`/`--options` in args, parse the referenced file, and inject
@@ -371,17 +393,18 @@ fn merge_options_file(args: Vec<String>) -> Vec<String> {
         if arg == "--" {
             break;
         }
-        if arg.starts_with("--") {
-            let key = if let Some(eq) = arg.find('=') {
-                arg[2..eq].to_string()
+        if let Some(long) = arg.strip_prefix("--") {
+            let key = if let Some(eq) = long.find('=') {
+                long[..eq].to_string()
             } else {
-                arg[2..].to_string()
+                long.to_string()
             };
             cli_flags.insert(key);
-        } else if arg.starts_with('-') && arg.len() > 2 {
+        } else if arg.len() > 2
+            && let Some(without_dash) = arg.strip_prefix('-')
+        {
             // Single-dash long option (already normalized to -- at this point,
             // but handle both for safety)
-            let without_dash = &arg[1..];
             let key = if let Some(eq) = without_dash.find('=') {
                 without_dash[..eq].to_string()
             } else {
@@ -401,15 +424,14 @@ fn merge_options_file(args: Vec<String>) -> Vec<String> {
         }
 
         // Split on first `=`, ` `, or `:`
-        let (name, value) =
-            if let Some(pos) = trimmed.find(|c: char| c == '=' || c == ' ' || c == ':') {
-                (
-                    trimmed[..pos].trim().to_string(),
-                    trimmed[pos + 1..].trim().to_string(),
-                )
-            } else {
-                (trimmed.to_string(), String::new())
-            };
+        let (name, value) = if let Some(pos) = trimmed.find(['=', ' ', ':']) {
+            (
+                trimmed[..pos].trim().to_string(),
+                trimmed[pos + 1..].trim().to_string(),
+            )
+        } else {
+            (trimmed.to_string(), String::new())
+        };
 
         // Strip leading dashes from name
         let name = name.trim_start_matches('-').to_string();
@@ -436,10 +458,8 @@ fn merge_options_file(args: Vec<String>) -> Vec<String> {
 /// Extract the options file path from args (looks for --options or -options).
 fn find_options_arg(args: &[String]) -> String {
     for i in 1..args.len() {
-        if args[i] == "--options" || args[i] == "-options" {
-            if i + 1 < args.len() {
-                return args[i + 1].clone();
-            }
+        if (args[i] == "--options" || args[i] == "-options") && i + 1 < args.len() {
+            return args[i + 1].clone();
         }
         if let Some(rest) = args[i].strip_prefix("--options=") {
             return rest.to_string();
@@ -457,20 +477,22 @@ fn parse_duration(s: &str) -> std::time::Duration {
     if s.is_empty() {
         return std::time::Duration::from_secs(60);
     }
-    if let Some(secs) = s.strip_suffix('s') {
-        if let Ok(v) = secs.parse::<u64>() {
-            return std::time::Duration::from_secs(v);
-        }
+    if let Some(secs) = s.strip_suffix('s')
+        && let Ok(v) = secs.parse::<u64>()
+    {
+        return std::time::Duration::from_secs(v);
     }
-    if let Some(mins) = s.strip_suffix('m') {
-        if let Ok(v) = mins.parse::<u64>() {
-            return std::time::Duration::from_secs(v * 60);
-        }
+    if let Some(mins) = s.strip_suffix('m')
+        && let Ok(v) = mins.parse::<u64>()
+        && let Some(seconds) = v.checked_mul(60)
+    {
+        return std::time::Duration::from_secs(seconds);
     }
-    if let Some(hours) = s.strip_suffix('h') {
-        if let Ok(v) = hours.parse::<u64>() {
-            return std::time::Duration::from_secs(v * 3600);
-        }
+    if let Some(hours) = s.strip_suffix('h')
+        && let Ok(v) = hours.parse::<u64>()
+        && let Some(seconds) = v.checked_mul(3600)
+    {
+        return std::time::Duration::from_secs(seconds);
     }
     // Fallback: try parsing as raw seconds
     if let Ok(v) = s.parse::<u64>() {
@@ -503,40 +525,40 @@ fn parse_min_free_spaces(min_free_space: &str, min_free_space_percent: &str) -> 
             }
             // Try parsing human-readable bytes: e.g. "10GiB", "500MiB", "1TiB"
             let s_upper = s.to_uppercase();
-            if let Some(rest) = s_upper.strip_suffix("TIB") {
-                if let Ok(v) = rest.trim().parse::<f64>() {
-                    return MinFreeSpace::Bytes((v * 1024.0 * 1024.0 * 1024.0 * 1024.0) as u64);
-                }
+            if let Some(rest) = s_upper.strip_suffix("TIB")
+                && let Ok(v) = rest.trim().parse::<f64>()
+            {
+                return MinFreeSpace::Bytes((v * 1024.0 * 1024.0 * 1024.0 * 1024.0) as u64);
             }
-            if let Some(rest) = s_upper.strip_suffix("GIB") {
-                if let Ok(v) = rest.trim().parse::<f64>() {
-                    return MinFreeSpace::Bytes((v * 1024.0 * 1024.0 * 1024.0) as u64);
-                }
+            if let Some(rest) = s_upper.strip_suffix("GIB")
+                && let Ok(v) = rest.trim().parse::<f64>()
+            {
+                return MinFreeSpace::Bytes((v * 1024.0 * 1024.0 * 1024.0) as u64);
             }
-            if let Some(rest) = s_upper.strip_suffix("MIB") {
-                if let Ok(v) = rest.trim().parse::<f64>() {
-                    return MinFreeSpace::Bytes((v * 1024.0 * 1024.0) as u64);
-                }
+            if let Some(rest) = s_upper.strip_suffix("MIB")
+                && let Ok(v) = rest.trim().parse::<f64>()
+            {
+                return MinFreeSpace::Bytes((v * 1024.0 * 1024.0) as u64);
             }
-            if let Some(rest) = s_upper.strip_suffix("KIB") {
-                if let Ok(v) = rest.trim().parse::<f64>() {
-                    return MinFreeSpace::Bytes((v * 1024.0) as u64);
-                }
+            if let Some(rest) = s_upper.strip_suffix("KIB")
+                && let Ok(v) = rest.trim().parse::<f64>()
+            {
+                return MinFreeSpace::Bytes((v * 1024.0) as u64);
             }
-            if let Some(rest) = s_upper.strip_suffix("TB") {
-                if let Ok(v) = rest.trim().parse::<f64>() {
-                    return MinFreeSpace::Bytes((v * 1_000_000_000_000.0) as u64);
-                }
+            if let Some(rest) = s_upper.strip_suffix("TB")
+                && let Ok(v) = rest.trim().parse::<f64>()
+            {
+                return MinFreeSpace::Bytes((v * 1_000_000_000_000.0) as u64);
             }
-            if let Some(rest) = s_upper.strip_suffix("GB") {
-                if let Ok(v) = rest.trim().parse::<f64>() {
-                    return MinFreeSpace::Bytes((v * 1_000_000_000.0) as u64);
-                }
+            if let Some(rest) = s_upper.strip_suffix("GB")
+                && let Ok(v) = rest.trim().parse::<f64>()
+            {
+                return MinFreeSpace::Bytes((v * 1_000_000_000.0) as u64);
             }
-            if let Some(rest) = s_upper.strip_suffix("MB") {
-                if let Ok(v) = rest.trim().parse::<f64>() {
-                    return MinFreeSpace::Bytes((v * 1_000_000.0) as u64);
-                }
+            if let Some(rest) = s_upper.strip_suffix("MB")
+                && let Ok(v) = rest.trim().parse::<f64>()
+            {
+                return MinFreeSpace::Bytes((v * 1_000_000.0) as u64);
             }
             // Default: 1%
             MinFreeSpace::Percent(1.0)
@@ -584,7 +606,7 @@ fn parse_volume_tags(tags_arg: &str, folder_count: usize) -> Vec<Vec<String>> {
     folder_tags
 }
 
-fn resolve_config(cli: Cli) -> VolumeServerConfig {
+fn resolve_config_with_env(cli: Cli, env: EnvLookup<'_>) -> VolumeServerConfig {
     // Backward compatibility: --mserver overrides --master
     let master_string = if !cli.mserver.is_empty() {
         &cli.mserver
@@ -739,7 +761,7 @@ fn resolve_config(cli: Cli) -> VolumeServerConfig {
     };
 
     // Parse security config from TOML file
-    let sec = parse_security_config(&cli.security_file);
+    let sec = parse_security_config_with_env(&cli.security_file, env);
 
     // Parse whitelist: merge CLI --whiteList with guard.white_list from security.toml
     let mut white_list: Vec<String> = cli
@@ -815,9 +837,8 @@ fn resolve_config(cli: Cli) -> VolumeServerConfig {
         grpc_allowed_wildcard_domain: sec.grpc_allowed_wildcard_domain,
         grpc_volume_allowed_common_names: sec.grpc_volume_allowed_common_names,
         tls_policy: sec.tls_policy,
-        enable_write_queue: std::env::var("SEAWEED_WRITE_QUEUE")
-            .map(|v| v == "1" || v == "true")
-            .unwrap_or(false),
+        enable_write_queue: env_string(env, "SEAWEED_WRITE_QUEUE")
+            .is_some_and(|v| v == "1" || v == "true"),
         security_file: cli.security_file,
         allow_untrusted_remote_endpoints: cli.allow_untrusted_remote_endpoints,
     }
@@ -895,9 +916,13 @@ const SECURITY_CONFIG_FILE_NAME: &str = "security.toml";
 /// allowed_commonNames = "volume-a.internal,volume-b.internal"
 /// ```
 pub fn parse_security_config(path: &str) -> SecurityConfig {
-    let Some(config_path) = resolve_security_config_path(path) else {
+    parse_security_config_with_env(path, &process_env)
+}
+
+fn parse_security_config_with_env(path: &str, env: EnvLookup<'_>) -> SecurityConfig {
+    let Some(config_path) = resolve_security_config_path(path, env) else {
         let mut cfg = SecurityConfig::default();
-        apply_env_overrides(&mut cfg);
+        apply_env_overrides(&mut cfg, env);
         return cfg;
     };
 
@@ -905,7 +930,7 @@ pub fn parse_security_config(path: &str) -> SecurityConfig {
         Ok(c) => c,
         Err(_) => {
             let mut cfg = SecurityConfig::default();
-            apply_env_overrides(&mut cfg);
+            apply_env_overrides(&mut cfg, env);
             return cfg;
         }
     };
@@ -987,7 +1012,9 @@ pub fn parse_security_config(path: &str) -> SecurityConfig {
                 },
                 Section::JwtSigning => match key {
                     "key" => cfg.jwt_signing_key = value.as_bytes().to_vec(),
-                    "expires_after_seconds" => cfg.jwt_signing_expires = value.parse().unwrap_or(10),
+                    "expires_after_seconds" => {
+                        cfg.jwt_signing_expires = value.parse().unwrap_or(10)
+                    }
                     _ => {}
                 },
                 Section::HttpsClient => match key {
@@ -1028,20 +1055,20 @@ pub fn parse_security_config(path: &str) -> SecurityConfig {
                     "cipher_suites" => cfg.tls_policy.cipher_suites = value.to_string(),
                     _ => {}
                 },
-                Section::Guard => match key {
-                    "white_list" => {
+                Section::Guard => {
+                    if key == "white_list" {
                         cfg.guard_white_list = value
                             .split(',')
                             .map(|s| s.trim().to_string())
                             .filter(|s| !s.is_empty())
                             .collect();
                     }
-                    _ => {}
-                },
-                Section::Access => match key {
-                    "ui" => cfg.access_ui = value.parse().unwrap_or(false),
-                    _ => {}
-                },
+                }
+                Section::Access => {
+                    if key == "ui" {
+                        cfg.access_ui = value.parse().unwrap_or(false)
+                    }
+                }
                 Section::None => {}
             }
         }
@@ -1059,19 +1086,19 @@ pub fn parse_security_config(path: &str) -> SecurityConfig {
     // Override with WEED_ environment variables (matches Go's Viper convention:
     // prefix WEED_, uppercase, replace . with _).
     // e.g. WEED_JWT_SIGNING_KEY overrides [jwt.signing] key
-    apply_env_overrides(&mut cfg);
+    apply_env_overrides(&mut cfg, env);
 
     cfg
 }
 
-fn resolve_security_config_path(path: &str) -> Option<PathBuf> {
+fn resolve_security_config_path(path: &str, env: EnvLookup<'_>) -> Option<PathBuf> {
     if !path.is_empty() {
         return Some(PathBuf::from(path));
     }
 
     default_security_config_candidates(
         std::env::current_dir().ok().as_deref(),
-        home_dir_from_env().as_deref(),
+        home_dir_from_env(env).as_deref(),
     )
     .into_iter()
     .find(|candidate| candidate.is_file())
@@ -1093,12 +1120,12 @@ fn default_security_config_candidates(
     candidates
 }
 
-fn home_dir_from_env() -> Option<PathBuf> {
-    std::env::var_os("HOME")
+fn home_dir_from_env(env: EnvLookup<'_>) -> Option<PathBuf> {
+    env("HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
-            std::env::var_os("USERPROFILE")
+            env("USERPROFILE")
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from)
         })
@@ -1106,80 +1133,80 @@ fn home_dir_from_env() -> Option<PathBuf> {
 
 /// Apply WEED_ environment variable overrides to a SecurityConfig.
 /// Matches Go's Viper convention: WEED_ prefix, uppercase, dots replaced with underscores.
-fn apply_env_overrides(cfg: &mut SecurityConfig) {
-    if let Ok(v) = std::env::var("WEED_JWT_SIGNING_KEY") {
+fn apply_env_overrides(cfg: &mut SecurityConfig, env: EnvLookup<'_>) {
+    if let Some(v) = env_string(env, "WEED_JWT_SIGNING_KEY") {
         cfg.jwt_signing_key = v.into_bytes();
     }
-    if let Ok(v) = std::env::var("WEED_JWT_SIGNING_EXPIRES_AFTER_SECONDS") {
+    if let Some(v) = env_string(env, "WEED_JWT_SIGNING_EXPIRES_AFTER_SECONDS") {
         cfg.jwt_signing_expires = v.parse().unwrap_or(cfg.jwt_signing_expires);
     }
-    if let Ok(v) = std::env::var("WEED_JWT_SIGNING_READ_KEY") {
+    if let Some(v) = env_string(env, "WEED_JWT_SIGNING_READ_KEY") {
         cfg.jwt_read_signing_key = v.into_bytes();
     }
-    if let Ok(v) = std::env::var("WEED_JWT_SIGNING_READ_EXPIRES_AFTER_SECONDS") {
+    if let Some(v) = env_string(env, "WEED_JWT_SIGNING_READ_EXPIRES_AFTER_SECONDS") {
         cfg.jwt_read_signing_expires = v.parse().unwrap_or(cfg.jwt_read_signing_expires);
     }
-    if let Ok(v) = std::env::var("WEED_HTTPS_VOLUME_CERT") {
+    if let Some(v) = env_string(env, "WEED_HTTPS_VOLUME_CERT") {
         cfg.https_cert_file = v;
     }
-    if let Ok(v) = std::env::var("WEED_HTTPS_VOLUME_KEY") {
+    if let Some(v) = env_string(env, "WEED_HTTPS_VOLUME_KEY") {
         cfg.https_key_file = v;
     }
-    if let Ok(v) = std::env::var("WEED_HTTPS_VOLUME_CA") {
+    if let Some(v) = env_string(env, "WEED_HTTPS_VOLUME_CA") {
         cfg.https_ca_file = v;
     }
-    if let Ok(v) = std::env::var("WEED_HTTPS_CLIENT_ENABLED") {
+    if let Some(v) = env_string(env, "WEED_HTTPS_CLIENT_ENABLED") {
         cfg.https_client_enabled = v == "true" || v == "1";
     }
-    if let Ok(v) = std::env::var("WEED_HTTPS_CLIENT_CERT") {
+    if let Some(v) = env_string(env, "WEED_HTTPS_CLIENT_CERT") {
         cfg.https_client_cert_file = v;
     }
-    if let Ok(v) = std::env::var("WEED_HTTPS_CLIENT_KEY") {
+    if let Some(v) = env_string(env, "WEED_HTTPS_CLIENT_KEY") {
         cfg.https_client_key_file = v;
     }
-    if let Ok(v) = std::env::var("WEED_HTTPS_CLIENT_CA") {
+    if let Some(v) = env_string(env, "WEED_HTTPS_CLIENT_CA") {
         cfg.https_client_ca_file = v;
     }
-    if let Ok(v) = std::env::var("WEED_GRPC_VOLUME_CERT") {
+    if let Some(v) = env_string(env, "WEED_GRPC_VOLUME_CERT") {
         cfg.grpc_cert_file = v;
     }
-    if let Ok(v) = std::env::var("WEED_GRPC_VOLUME_KEY") {
+    if let Some(v) = env_string(env, "WEED_GRPC_VOLUME_KEY") {
         cfg.grpc_key_file = v;
     }
-    if let Ok(v) = std::env::var("WEED_GRPC_VOLUME_CLIENT_CERT") {
+    if let Some(v) = env_string(env, "WEED_GRPC_VOLUME_CLIENT_CERT") {
         cfg.grpc_client_cert_file = v;
     }
-    if let Ok(v) = std::env::var("WEED_GRPC_VOLUME_CLIENT_KEY") {
+    if let Some(v) = env_string(env, "WEED_GRPC_VOLUME_CLIENT_KEY") {
         cfg.grpc_client_key_file = v;
     }
-    if let Ok(v) = std::env::var("WEED_GRPC_CA") {
+    if let Some(v) = env_string(env, "WEED_GRPC_CA") {
         cfg.grpc_ca_file = v;
-    } else if let Ok(v) = std::env::var("WEED_GRPC_VOLUME_CA") {
+    } else if let Some(v) = env_string(env, "WEED_GRPC_VOLUME_CA") {
         cfg.grpc_ca_file = v;
     }
-    if let Ok(v) = std::env::var("WEED_GRPC_ALLOWED_WILDCARD_DOMAIN") {
+    if let Some(v) = env_string(env, "WEED_GRPC_ALLOWED_WILDCARD_DOMAIN") {
         cfg.grpc_allowed_wildcard_domain = v;
     }
-    if let Ok(v) = std::env::var("WEED_GRPC_VOLUME_ALLOWED_COMMONNAMES") {
+    if let Some(v) = env_string(env, "WEED_GRPC_VOLUME_ALLOWED_COMMONNAMES") {
         cfg.grpc_volume_allowed_common_names = v.split(',').map(|name| name.to_string()).collect();
     }
-    if let Ok(v) = std::env::var("WEED_TLS_MIN_VERSION") {
+    if let Some(v) = env_string(env, "WEED_TLS_MIN_VERSION") {
         cfg.tls_policy.min_version = v;
     }
-    if let Ok(v) = std::env::var("WEED_TLS_MAX_VERSION") {
+    if let Some(v) = env_string(env, "WEED_TLS_MAX_VERSION") {
         cfg.tls_policy.max_version = v;
     }
-    if let Ok(v) = std::env::var("WEED_TLS_CIPHER_SUITES") {
+    if let Some(v) = env_string(env, "WEED_TLS_CIPHER_SUITES") {
         cfg.tls_policy.cipher_suites = v;
     }
-    if let Ok(v) = std::env::var("WEED_GUARD_WHITE_LIST") {
+    if let Some(v) = env_string(env, "WEED_GUARD_WHITE_LIST") {
         cfg.guard_white_list = v
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
     }
-    if let Ok(v) = std::env::var("WEED_ACCESS_UI") {
+    if let Some(v) = env_string(env, "WEED_ACCESS_UI") {
         cfg.access_ui = v == "true" || v == "1";
     }
 }
@@ -1188,12 +1215,11 @@ fn apply_env_overrides(cfg: &mut SecurityConfig) {
 /// Mirrors Go's `util.DetectedHostAddress()`.
 fn detect_host_address() -> String {
     // Connect to a remote address to determine the local outbound IP
-    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
-        if socket.connect("8.8.8.8:80").is_ok() {
-            if let Ok(addr) = socket.local_addr() {
-                return addr.ip().to_string();
-            }
-        }
+    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0")
+        && socket.connect("8.8.8.8:80").is_ok()
+        && let Ok(addr) = socket.local_addr()
+    {
+        return addr.ip().to_string();
     }
     "localhost".to_string()
 }
@@ -1201,39 +1227,19 @@ fn detect_host_address() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
+    use std::collections::HashMap;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
+    /// Serialises the tests that move the process working directory against
+    /// the ones that read it. `set_current_dir` is safe, but it is still
+    /// process-global: without this, a `parse_security_config("")` in one test
+    /// would search another test's temporary directory.
+    ///
+    /// Nothing here guards the environment any more — tests inject an
+    /// [`EnvLookup`] instead of mutating the real one.
     fn process_state_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
-
-    // SAFETY (all env mutation in this module): `set_var`/`remove_var` are
-    // unsafe as of Rust 2024 because they race with concurrent readers in
-    // other threads. Every test that reaches these helpers holds
-    // `process_state_lock()` for the duration, so only one test at a time
-    // touches the environment and none observes another's edit.
-    fn with_temp_env_var<F: FnOnce()>(key: &str, value: Option<&str>, f: F) {
-        let previous = std::env::var_os(key);
-        unsafe {
-            match value {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
-            }
-        }
-        f();
-        restore_env_var(key, previous);
-    }
-
-    fn restore_env_var(key: &str, value: Option<OsString>) {
-        unsafe {
-            if let Some(value) = value {
-                std::env::set_var(key, value);
-            } else {
-                std::env::remove_var(key);
-            }
-        }
     }
 
     fn with_temp_current_dir<F: FnOnce()>(dir: &Path, f: F) {
@@ -1243,51 +1249,14 @@ mod tests {
         std::env::set_current_dir(previous).unwrap();
     }
 
-    fn with_cleared_security_env<F: FnOnce()>(f: F) {
-        const KEYS: &[&str] = &[
-            "WEED_JWT_SIGNING_KEY",
-            "WEED_JWT_SIGNING_EXPIRES_AFTER_SECONDS",
-            "WEED_JWT_SIGNING_READ_KEY",
-            "WEED_JWT_SIGNING_READ_EXPIRES_AFTER_SECONDS",
-            "WEED_HTTPS_VOLUME_CERT",
-            "WEED_HTTPS_VOLUME_KEY",
-            "WEED_HTTPS_VOLUME_CA",
-            "WEED_HTTPS_CLIENT_ENABLED",
-            "WEED_HTTPS_CLIENT_CERT",
-            "WEED_HTTPS_CLIENT_KEY",
-            "WEED_HTTPS_CLIENT_CA",
-            "WEED_GRPC_VOLUME_CERT",
-            "WEED_GRPC_VOLUME_KEY",
-            "WEED_GRPC_VOLUME_CLIENT_CERT",
-            "WEED_GRPC_VOLUME_CLIENT_KEY",
-            "WEED_GRPC_CA",
-            "WEED_GRPC_VOLUME_CA",
-            "WEED_GRPC_ALLOWED_WILDCARD_DOMAIN",
-            "WEED_GRPC_VOLUME_ALLOWED_COMMONNAMES",
-            "WEED_TLS_MIN_VERSION",
-            "WEED_TLS_MAX_VERSION",
-            "WEED_TLS_CIPHER_SUITES",
-            "WEED_GUARD_WHITE_LIST",
-            "WEED_ACCESS_UI",
-        ];
-
-        let previous: Vec<(&str, Option<OsString>)> = KEYS
+    /// The whole environment a test wants the config layer to see, ready to
+    /// pass as `&env`. `&|_| None` is an environment with nothing set at all.
+    fn fake_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> + use<> {
+        let map: HashMap<String, OsString> = pairs
             .iter()
-            .map(|key| (*key, std::env::var_os(key)))
+            .map(|(key, value)| ((*key).to_string(), OsString::from(*value)))
             .collect();
-
-        for key in KEYS {
-            // SAFETY: as above — the caller holds `process_state_lock()`.
-            unsafe {
-                std::env::remove_var(key);
-            }
-        }
-
-        f();
-
-        for (key, value) in previous {
-            restore_env_var(key, value);
-        }
+        move |key| map.get(key).cloned()
     }
 
     #[test]
@@ -1297,6 +1266,14 @@ mod tests {
         assert_eq!(parse_duration("1h"), std::time::Duration::from_secs(3600));
         assert_eq!(parse_duration("30"), std::time::Duration::from_secs(30));
         assert_eq!(parse_duration(""), std::time::Duration::from_secs(60));
+        assert_eq!(
+            parse_duration("307445734561825861m"),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            parse_duration("5124095576030432h"),
+            std::time::Duration::from_secs(60)
+        );
     }
 
     #[test]
@@ -1416,17 +1393,17 @@ mod tests {
 
     #[test]
     fn test_resolve_config_defaults_dir_to_platform_temp_dir() {
-        // resolve_config reads HOME/USERPROFILE and the WEED_* set, so it has to
-        // hold the same lock the mutation helpers take — a concurrent set_var
-        // during this read is exactly what makes those calls unsafe.
+        // With no --securityFile, the security-config search reads the process
+        // working directory, so this has to hold the lock against
+        // `with_temp_current_dir`. The environment is injected, not shared.
         let _guard = process_state_lock();
-        let cfg = resolve_config(Cli::parse_from(["bin"]));
+        let cfg = resolve_config_with_env(Cli::parse_from(["bin"]), &|_| None);
         assert_eq!(cfg.folders, vec![default_volume_dir()]);
     }
 
     #[test]
     fn test_resolve_config_index_accepts_redb_and_leveldb_aliases() {
-        // As above: resolve_config reads the environment.
+        // As above: the security-config search reads the working directory.
         let _guard = process_state_lock();
         let pairs = [
             ("memory", NeedleMapKind::InMemory),
@@ -1438,14 +1415,14 @@ mod tests {
             ("leveldbLarge", NeedleMapKind::RedbLarge),
         ];
         for (input, expected) in pairs {
-            let cfg = resolve_config(Cli::parse_from(["bin", "--index", input]));
+            let cfg =
+                resolve_config_with_env(Cli::parse_from(["bin", "--index", input]), &|_| None);
             assert_eq!(cfg.index_type, expected, "input={}", input);
         }
     }
 
     #[test]
     fn test_parse_security_config_access_ui() {
-        let _guard = process_state_lock();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
             tmp.path(),
@@ -1459,11 +1436,9 @@ ui = true
         )
         .unwrap();
 
-        with_cleared_security_env(|| {
-            let cfg = parse_security_config(tmp.path().to_str().unwrap());
-            assert_eq!(cfg.jwt_signing_key, b"secret");
-            assert!(cfg.access_ui);
-        });
+        let cfg = parse_security_config_with_env(tmp.path().to_str().unwrap(), &|_| None);
+        assert_eq!(cfg.jwt_signing_key, b"secret");
+        assert!(cfg.access_ui);
     }
 
     #[test]
@@ -1480,10 +1455,8 @@ key = "cwd-secret"
         .unwrap();
 
         with_temp_current_dir(tmp.path(), || {
-            with_temp_env_var("WEED_JWT_SIGNING_KEY", None, || {
-                let cfg = parse_security_config("");
-                assert_eq!(cfg.jwt_signing_key, b"cwd-secret");
-            });
+            let cfg = parse_security_config_with_env("", &|_| None);
+            assert_eq!(cfg.jwt_signing_key, b"cwd-secret");
         });
     }
 
@@ -1503,19 +1476,15 @@ key = "home-secret"
         )
         .unwrap();
 
+        let env = fake_env(&[("HOME", home_dir.path().to_str().unwrap())]);
         with_temp_current_dir(current_dir.path(), || {
-            with_temp_env_var("WEED_JWT_SIGNING_KEY", None, || {
-                with_temp_env_var("HOME", Some(home_dir.path().to_str().unwrap()), || {
-                    let cfg = parse_security_config("");
-                    assert_eq!(cfg.jwt_signing_key, b"home-secret");
-                });
-            });
+            let cfg = parse_security_config_with_env("", &env);
+            assert_eq!(cfg.jwt_signing_key, b"home-secret");
         });
     }
 
     #[test]
     fn test_parse_security_config_uses_grpc_root_ca() {
-        let _guard = process_state_lock();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
             tmp.path(),
@@ -1530,17 +1499,14 @@ key = "/etc/seaweedfs/volume-key.pem"
         )
         .unwrap();
 
-        with_cleared_security_env(|| {
-            let cfg = parse_security_config(tmp.path().to_str().unwrap());
-            assert_eq!(cfg.grpc_ca_file, "/etc/seaweedfs/grpc-ca.pem");
-            assert_eq!(cfg.grpc_cert_file, "/etc/seaweedfs/volume-cert.pem");
-            assert_eq!(cfg.grpc_key_file, "/etc/seaweedfs/volume-key.pem");
-        });
+        let cfg = parse_security_config_with_env(tmp.path().to_str().unwrap(), &|_| None);
+        assert_eq!(cfg.grpc_ca_file, "/etc/seaweedfs/grpc-ca.pem");
+        assert_eq!(cfg.grpc_cert_file, "/etc/seaweedfs/volume-cert.pem");
+        assert_eq!(cfg.grpc_key_file, "/etc/seaweedfs/volume-key.pem");
     }
 
     #[test]
     fn test_parse_security_config_uses_grpc_volume_client_cert() {
-        let _guard = process_state_lock();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
             tmp.path(),
@@ -1554,22 +1520,19 @@ client_key = "/etc/seaweedfs/volume-client-key.pem"
         )
         .unwrap();
 
-        with_cleared_security_env(|| {
-            let cfg = parse_security_config(tmp.path().to_str().unwrap());
-            assert_eq!(
-                cfg.grpc_client_cert_file,
-                "/etc/seaweedfs/volume-client-cert.pem"
-            );
-            assert_eq!(
-                cfg.grpc_client_key_file,
-                "/etc/seaweedfs/volume-client-key.pem"
-            );
-        });
+        let cfg = parse_security_config_with_env(tmp.path().to_str().unwrap(), &|_| None);
+        assert_eq!(
+            cfg.grpc_client_cert_file,
+            "/etc/seaweedfs/volume-client-cert.pem"
+        );
+        assert_eq!(
+            cfg.grpc_client_key_file,
+            "/etc/seaweedfs/volume-client-key.pem"
+        );
     }
 
     #[test]
     fn test_parse_security_config_uses_grpc_peer_name_policy() {
-        let _guard = process_state_lock();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
             tmp.path(),
@@ -1583,22 +1546,19 @@ allowed_commonNames = "volume-a.internal,volume-b.internal"
         )
         .unwrap();
 
-        with_cleared_security_env(|| {
-            let cfg = parse_security_config(tmp.path().to_str().unwrap());
-            assert_eq!(cfg.grpc_allowed_wildcard_domain, ".example.com");
-            assert_eq!(
-                cfg.grpc_volume_allowed_common_names,
-                vec![
-                    String::from("volume-a.internal"),
-                    String::from("volume-b.internal")
-                ]
-            );
-        });
+        let cfg = parse_security_config_with_env(tmp.path().to_str().unwrap(), &|_| None);
+        assert_eq!(cfg.grpc_allowed_wildcard_domain, ".example.com");
+        assert_eq!(
+            cfg.grpc_volume_allowed_common_names,
+            vec![
+                String::from("volume-a.internal"),
+                String::from("volume-b.internal")
+            ]
+        );
     }
 
     #[test]
     fn test_parse_security_config_uses_https_client_settings() {
-        let _guard = process_state_lock();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
             tmp.path(),
@@ -1612,18 +1572,15 @@ ca = "/etc/seaweedfs/client-ca.pem"
         )
         .unwrap();
 
-        with_cleared_security_env(|| {
-            let cfg = parse_security_config(tmp.path().to_str().unwrap());
-            assert!(cfg.https_client_enabled);
-            assert_eq!(cfg.https_client_cert_file, "/etc/seaweedfs/client-cert.pem");
-            assert_eq!(cfg.https_client_key_file, "/etc/seaweedfs/client-key.pem");
-            assert_eq!(cfg.https_client_ca_file, "/etc/seaweedfs/client-ca.pem");
-        });
+        let cfg = parse_security_config_with_env(tmp.path().to_str().unwrap(), &|_| None);
+        assert!(cfg.https_client_enabled);
+        assert_eq!(cfg.https_client_cert_file, "/etc/seaweedfs/client-cert.pem");
+        assert_eq!(cfg.https_client_key_file, "/etc/seaweedfs/client-key.pem");
+        assert_eq!(cfg.https_client_ca_file, "/etc/seaweedfs/client-ca.pem");
     }
 
     #[test]
     fn test_parse_security_config_uses_tls_policy_settings() {
-        let _guard = process_state_lock();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
             tmp.path(),
@@ -1636,15 +1593,13 @@ cipher_suites = "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
         )
         .unwrap();
 
-        with_cleared_security_env(|| {
-            let cfg = parse_security_config(tmp.path().to_str().unwrap());
-            assert_eq!(cfg.tls_policy.min_version, "TLS 1.2");
-            assert_eq!(cfg.tls_policy.max_version, "TLS 1.3");
-            assert_eq!(
-                cfg.tls_policy.cipher_suites,
-                "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
-            );
-        });
+        let cfg = parse_security_config_with_env(tmp.path().to_str().unwrap(), &|_| None);
+        assert_eq!(cfg.tls_policy.min_version, "TLS 1.2");
+        assert_eq!(cfg.tls_policy.max_version, "TLS 1.3");
+        assert_eq!(
+            cfg.tls_policy.cipher_suites,
+            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+        );
     }
 
     #[test]
@@ -1745,16 +1700,15 @@ cipher_suites = "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
 
     #[test]
     fn test_env_override_jwt_signing_key() {
+        // No file path, so the search reads the working directory.
         let _guard = process_state_lock();
-        with_temp_env_var("WEED_JWT_SIGNING_KEY", Some("env-secret"), || {
-            let cfg = parse_security_config("");
-            assert_eq!(cfg.jwt_signing_key, b"env-secret");
-        });
+        let env = fake_env(&[("WEED_JWT_SIGNING_KEY", "env-secret")]);
+        let cfg = parse_security_config_with_env("", &env);
+        assert_eq!(cfg.jwt_signing_key, b"env-secret");
     }
 
     #[test]
     fn test_env_override_takes_precedence_over_file() {
-        let _guard = process_state_lock();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
             tmp.path(),
@@ -1765,31 +1719,26 @@ key = "file-secret"
         )
         .unwrap();
 
-        with_temp_env_var("WEED_JWT_SIGNING_KEY", Some("env-secret"), || {
-            let cfg = parse_security_config(tmp.path().to_str().unwrap());
-            assert_eq!(cfg.jwt_signing_key, b"env-secret");
-        });
+        let env = fake_env(&[("WEED_JWT_SIGNING_KEY", "env-secret")]);
+        let cfg = parse_security_config_with_env(tmp.path().to_str().unwrap(), &env);
+        assert_eq!(cfg.jwt_signing_key, b"env-secret");
     }
 
     #[test]
     fn test_env_override_guard_white_list() {
+        // No file path, so the search reads the working directory.
         let _guard = process_state_lock();
-        with_temp_env_var(
-            "WEED_GUARD_WHITE_LIST",
-            Some("10.0.0.0/8, 192.168.1.0/24"),
-            || {
-                let cfg = parse_security_config("");
-                assert_eq!(cfg.guard_white_list, vec!["10.0.0.0/8", "192.168.1.0/24"]);
-            },
-        );
+        let env = fake_env(&[("WEED_GUARD_WHITE_LIST", "10.0.0.0/8, 192.168.1.0/24")]);
+        let cfg = parse_security_config_with_env("", &env);
+        assert_eq!(cfg.guard_white_list, vec!["10.0.0.0/8", "192.168.1.0/24"]);
     }
 
     #[test]
     fn test_env_override_access_ui() {
+        // No file path, so the search reads the working directory.
         let _guard = process_state_lock();
-        with_temp_env_var("WEED_ACCESS_UI", Some("true"), || {
-            let cfg = parse_security_config("");
-            assert!(cfg.access_ui);
-        });
+        let env = fake_env(&[("WEED_ACCESS_UI", "true")]);
+        let cfg = parse_security_config_with_env("", &env);
+        assert!(cfg.access_ui);
     }
 }

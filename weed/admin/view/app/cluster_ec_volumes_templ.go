@@ -37,7 +37,7 @@ func ClusterEcVolumes(data dash.ClusterEcVolumesData) templ.Component {
 			templ_7745c5c3_Var1 = templ.NopComponent
 		}
 		ctx = templ.ClearChildren(ctx)
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 1, "<div class=\"d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom\"><div><h1 class=\"h2\"><i class=\"fas fa-database me-2\"></i>EC Volumes</h1>")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 1, "<div class=\"d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom\"><div><h1 class=\"h2\"><i class=\"bi bi-database me-2\"></i>EC Volumes</h1>")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -47,19 +47,19 @@ func ClusterEcVolumes(data dash.ClusterEcVolumesData) templ.Component {
 				return templ_7745c5c3_Err
 			}
 			if data.Collection == "default" {
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 3, "<span class=\"badge bg-secondary text-white me-2\"><i class=\"fas fa-filter me-1\"></i>Collection: default</span> ")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 3, "<span class=\"badge bg-secondary text-white me-2\"><i class=\"bi bi-funnel me-1\"></i>Collection: default</span> ")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
 			} else {
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 4, "<span class=\"badge bg-info text-white me-2\"><i class=\"fas fa-filter me-1\"></i>Collection: ")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 4, "<span class=\"badge bg-info text-white me-2\"><i class=\"bi bi-funnel me-1\"></i>Collection: ")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
 				var templ_7745c5c3_Var2 string
 				templ_7745c5c3_Var2, templ_7745c5c3_Err = templ.JoinStringErrs(data.Collection)
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `view/app/cluster_ec_volumes.templ`, Line: 25, Col: 90}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `view/app/cluster_ec_volumes.templ`, Line: 25, Col: 89}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var2))
 				if templ_7745c5c3_Err != nil {
@@ -83,7 +83,7 @@ func ClusterEcVolumes(data dash.ClusterEcVolumesData) templ.Component {
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 7, "\" class=\"btn btn-sm btn-outline-secondary\"><i class=\"fas fa-times me-1\"></i>Clear Filter</a></div>")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 7, "\" class=\"btn btn-sm btn-outline-secondary\"><i class=\"bi bi-x me-1\"></i>Clear Filter</a></div>")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
@@ -138,7 +138,7 @@ func ClusterEcVolumes(data dash.ClusterEcVolumesData) templ.Component {
 				return templ_7745c5c3_Err
 			}
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 18, ">100 per page</option></select> <button type=\"button\" class=\"btn btn-sm btn-outline-primary\" onclick=\"window.location.reload()\"><i class=\"fas fa-refresh me-1\"></i>Refresh</button></div></div></div><!-- Statistics Cards --><div class=\"row mb-4\"><div class=\"col-md-3\"><div class=\"card text-bg-primary\"><div class=\"card-body\"><div class=\"d-flex justify-content-between\"><div><h6 class=\"card-title\">Total Volumes</h6><h4 class=\"mb-0\">")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 18, ">100 per page</option></select> <button type=\"button\" class=\"btn btn-sm btn-outline-primary\" onclick=\"window.location.reload()\"><i class=\"bi bi-arrow-clockwise me-1\"></i>Refresh</button></div></div></div><!-- Statistics Cards --><div class=\"row mb-4\"><div class=\"col-md-3\"><div class=\"card text-bg-primary\"><div class=\"card-body\"><div class=\"d-flex justify-content-between\"><div><h6 class=\"card-title\">Total Volumes</h6><h4 class=\"mb-0\">")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -151,7 +151,7 @@ func ClusterEcVolumes(data dash.ClusterEcVolumesData) templ.Component {
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 19, "</h4></div><div class=\"align-self-center\"><i class=\"fas fa-cubes fa-2x\"></i></div></div></div></div></div><div class=\"col-md-3\"><div class=\"card text-bg-info\"><div class=\"card-body\"><div class=\"d-flex justify-content-between\"><div><h6 class=\"card-title\">Total Shards</h6><h4 class=\"mb-0\">")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 19, "</h4></div><div class=\"align-self-center\"><i class=\"bi bi-boxes icon-2x\"></i></div></div></div></div></div><div class=\"col-md-3\"><div class=\"card text-bg-info\"><div class=\"card-body\"><div class=\"d-flex justify-content-between\"><div><h6 class=\"card-title\">Total Shards</h6><h4 class=\"mb-0\">")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -164,7 +164,7 @@ func ClusterEcVolumes(data dash.ClusterEcVolumesData) templ.Component {
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 20, "</h4></div><div class=\"align-self-center\"><i class=\"fas fa-puzzle-piece fa-2x\"></i></div></div></div></div></div><div class=\"col-md-3\"><div class=\"card text-bg-success\"><div class=\"card-body\"><div class=\"d-flex justify-content-between\"><div><h6 class=\"card-title\">Healthy Volumes</h6><h4 class=\"mb-0\">")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 20, "</h4></div><div class=\"align-self-center\"><i class=\"bi bi-puzzle icon-2x\"></i></div></div></div></div></div><div class=\"col-md-3\"><div class=\"card text-bg-success\"><div class=\"card-body\"><div class=\"d-flex justify-content-between\"><div><h6 class=\"card-title\">Healthy Volumes</h6><h4 class=\"mb-0\">")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -177,7 +177,7 @@ func ClusterEcVolumes(data dash.ClusterEcVolumesData) templ.Component {
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 21, "</h4><small>All shards present</small></div><div class=\"align-self-center\"><i class=\"fas fa-check-circle fa-2x\"></i></div></div></div></div></div><div class=\"col-md-3\"><div class=\"card text-bg-warning\"><div class=\"card-body\"><div class=\"d-flex justify-content-between\"><div><h6 class=\"card-title\">Degraded Volumes</h6><h4 class=\"mb-0\">")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 21, "</h4><small>All shards present</small></div><div class=\"align-self-center\"><i class=\"bi bi-check-circle icon-2x\"></i></div></div></div></div></div><div class=\"col-md-3\"><div class=\"card text-bg-warning\"><div class=\"card-body\"><div class=\"d-flex justify-content-between\"><div><h6 class=\"card-title\">Degraded Volumes</h6><h4 class=\"mb-0\">")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -190,7 +190,7 @@ func ClusterEcVolumes(data dash.ClusterEcVolumesData) templ.Component {
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 22, "</h4><small>Incomplete/Critical</small></div><div class=\"align-self-center\"><i class=\"fas fa-exclamation-triangle fa-2x\"></i></div></div></div></div></div></div><!-- EC Storage Information Note --><div class=\"alert alert-info mb-4\" role=\"alert\"><i class=\"fas fa-info-circle me-2\"></i> <strong>EC Storage Note:</strong> EC volumes use erasure coding; the standard ratio is ")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 22, "</h4><small>Incomplete/Critical</small></div><div class=\"align-self-center\"><i class=\"bi bi-exclamation-triangle icon-2x\"></i></div></div></div></div></div></div><!-- EC Storage Information Note --><div class=\"alert alert-info mb-4\" role=\"alert\"><i class=\"bi bi-info-circle me-2\"></i> <strong>EC Storage Note:</strong> EC volumes use erasure coding; the standard ratio is ")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -209,18 +209,18 @@ func ClusterEcVolumes(data dash.ClusterEcVolumesData) templ.Component {
 		}
 		if data.SortBy == "volume_id" {
 			if data.SortOrder == "asc" {
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 24, "<i class=\"fas fa-sort-up ms-1\"></i>")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 24, "<i class=\"bi bi-sort-up ms-1\"></i>")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
 			} else {
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 25, "<i class=\"fas fa-sort-down ms-1\"></i>")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 25, "<i class=\"bi bi-sort-down ms-1\"></i>")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
 			}
 		} else {
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 26, "<i class=\"fas fa-sort ms-1 text-muted\"></i>")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 26, "<i class=\"bi bi-arrow-down-up ms-1 text-muted\"></i>")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
@@ -236,18 +236,18 @@ func ClusterEcVolumes(data dash.ClusterEcVolumesData) templ.Component {
 			}
 			if data.SortBy == "collection" {
 				if data.SortOrder == "asc" {
-					templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 29, "<i class=\"fas fa-sort-up ms-1\"></i>")
+					templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 29, "<i class=\"bi bi-sort-up ms-1\"></i>")
 					if templ_7745c5c3_Err != nil {
 						return templ_7745c5c3_Err
 					}
 				} else {
-					templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 30, "<i class=\"fas fa-sort-down ms-1\"></i>")
+					templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 30, "<i class=\"bi bi-sort-down ms-1\"></i>")
 					if templ_7745c5c3_Err != nil {
 						return templ_7745c5c3_Err
 					}
 				}
 			} else {
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 31, "<i class=\"fas fa-sort ms-1 text-muted\"></i>")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 31, "<i class=\"bi bi-arrow-down-up ms-1 text-muted\"></i>")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
@@ -263,18 +263,18 @@ func ClusterEcVolumes(data dash.ClusterEcVolumesData) templ.Component {
 		}
 		if data.SortBy == "total_shards" {
 			if data.SortOrder == "asc" {
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 34, "<i class=\"fas fa-sort-up ms-1\"></i>")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 34, "<i class=\"bi bi-sort-up ms-1\"></i>")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
 			} else {
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 35, "<i class=\"fas fa-sort-down ms-1\"></i>")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 35, "<i class=\"bi bi-sort-down ms-1\"></i>")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
 			}
 		} else {
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 36, "<i class=\"fas fa-sort ms-1 text-muted\"></i>")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 36, "<i class=\"bi bi-arrow-down-up ms-1 text-muted\"></i>")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
@@ -285,18 +285,18 @@ func ClusterEcVolumes(data dash.ClusterEcVolumesData) templ.Component {
 		}
 		if data.SortBy == "completeness" {
 			if data.SortOrder == "asc" {
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 38, "<i class=\"fas fa-sort-up ms-1\"></i>")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 38, "<i class=\"bi bi-sort-up ms-1\"></i>")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
 			} else {
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 39, "<i class=\"fas fa-sort-down ms-1\"></i>")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 39, "<i class=\"bi bi-sort-down ms-1\"></i>")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
 			}
 		} else {
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 40, "<i class=\"fas fa-sort ms-1 text-muted\"></i>")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 40, "<i class=\"bi bi-arrow-down-up ms-1 text-muted\"></i>")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
@@ -482,7 +482,7 @@ func ClusterEcVolumes(data dash.ClusterEcVolumesData) templ.Component {
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 64, "\" title=\"View EC volume details\"><i class=\"fas fa-info-circle\"></i></button></div></td></tr>")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 64, "\" title=\"View EC volume details\"><i class=\"bi bi-info-circle\"></i></button></div></td></tr>")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
@@ -497,7 +497,7 @@ func ClusterEcVolumes(data dash.ClusterEcVolumesData) templ.Component {
 				return templ_7745c5c3_Err
 			}
 			if data.Page > 1 {
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 67, "<li class=\"page-item\"><a class=\"page-link\" href=\"#\" onclick=\"goToPage(event)\" data-page=\"1\"><i class=\"fas fa-angle-double-left\"></i></a></li><li class=\"page-item\"><a class=\"page-link\" href=\"#\" onclick=\"goToPage(event)\" data-page=\"")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 67, "<li class=\"page-item\"><a class=\"page-link\" href=\"#\" onclick=\"goToPage(event)\" data-page=\"1\"><i class=\"bi bi-chevron-double-left\"></i></a></li><li class=\"page-item\"><a class=\"page-link\" href=\"#\" onclick=\"goToPage(event)\" data-page=\"")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
@@ -510,7 +510,7 @@ func ClusterEcVolumes(data dash.ClusterEcVolumesData) templ.Component {
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 68, "\"><i class=\"fas fa-chevron-left\"></i></a></li>")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 68, "\"><i class=\"bi bi-chevron-left\"></i></a></li>")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
@@ -672,7 +672,7 @@ func ClusterEcVolumes(data dash.ClusterEcVolumesData) templ.Component {
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 87, "\"><i class=\"fas fa-chevron-right\"></i></a></li><li class=\"page-item\"><a class=\"page-link\" href=\"#\" onclick=\"goToPage(event)\" data-page=\"")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 87, "\"><i class=\"bi bi-chevron-right\"></i></a></li><li class=\"page-item\"><a class=\"page-link\" href=\"#\" onclick=\"goToPage(event)\" data-page=\"")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
@@ -685,7 +685,7 @@ func ClusterEcVolumes(data dash.ClusterEcVolumesData) templ.Component {
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 88, "\"><i class=\"fas fa-angle-double-right\"></i></a></li>")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 88, "\"><i class=\"bi bi-chevron-double-right\"></i></a></li>")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
@@ -989,7 +989,7 @@ func displayVolumeDistribution(volume dash.EcVolumeWithShards) templ.Component {
 			templ_7745c5c3_Var30 = templ.NopComponent
 		}
 		ctx = templ.ClearChildren(ctx)
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 96, "<div class=\"small\"><i class=\"fas fa-sitemap me-1\"></i> ")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 96, "<div class=\"small\"><i class=\"bi bi-diagram-3 me-1\"></i> ")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -1038,20 +1038,20 @@ func displayEcVolumeStatus(volume dash.EcVolumeWithShards) templ.Component {
 		}
 		ctx = templ.ClearChildren(ctx)
 		if volume.IsComplete {
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 98, "<span class=\"badge bg-success\"><i class=\"fas fa-check me-1\"></i>Complete</span>")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 98, "<span class=\"badge bg-success\"><i class=\"bi bi-check me-1\"></i>Complete</span>")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
 		} else {
 			if len(volume.MissingShards) > volume.DataShards {
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 99, " <span class=\"badge bg-danger\"><i class=\"fas fa-skull me-1\"></i>Critical (")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 99, " <span class=\"badge bg-danger\"><i class=\"bi bi-exclamation-octagon me-1\"></i>Critical (")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
 				var templ_7745c5c3_Var33 string
 				templ_7745c5c3_Var33, templ_7745c5c3_Err = templ.JoinStringErrs(fmt.Sprintf("%d", len(volume.MissingShards)))
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `view/app/cluster_ec_volumes.templ`, Line: 580, Col: 130}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `view/app/cluster_ec_volumes.templ`, Line: 580, Col: 143}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var33))
 				if templ_7745c5c3_Err != nil {
@@ -1062,14 +1062,14 @@ func displayEcVolumeStatus(volume dash.EcVolumeWithShards) templ.Component {
 					return templ_7745c5c3_Err
 				}
 			} else if len(volume.MissingShards) > (volume.DataShards / 2) {
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 101, " <span class=\"badge bg-warning\"><i class=\"fas fa-exclamation-triangle me-1\"></i>Degraded (")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 101, " <span class=\"badge bg-warning\"><i class=\"bi bi-exclamation-triangle me-1\"></i>Degraded (")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
 				var templ_7745c5c3_Var34 string
 				templ_7745c5c3_Var34, templ_7745c5c3_Err = templ.JoinStringErrs(fmt.Sprintf("%d", len(volume.MissingShards)))
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `view/app/cluster_ec_volumes.templ`, Line: 583, Col: 146}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `view/app/cluster_ec_volumes.templ`, Line: 583, Col: 145}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var34))
 				if templ_7745c5c3_Err != nil {
@@ -1080,14 +1080,14 @@ func displayEcVolumeStatus(volume dash.EcVolumeWithShards) templ.Component {
 					return templ_7745c5c3_Err
 				}
 			} else if len(volume.MissingShards) > (volume.ParityShards / 2) {
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 103, " <span class=\"badge bg-warning\"><i class=\"fas fa-info-circle me-1\"></i>Incomplete (")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 103, " <span class=\"badge bg-warning\"><i class=\"bi bi-info-circle me-1\"></i>Incomplete (")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
 				var templ_7745c5c3_Var35 string
 				templ_7745c5c3_Var35, templ_7745c5c3_Err = templ.JoinStringErrs(fmt.Sprintf("%d", len(volume.MissingShards)))
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `view/app/cluster_ec_volumes.templ`, Line: 586, Col: 139}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `view/app/cluster_ec_volumes.templ`, Line: 586, Col: 138}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var35))
 				if templ_7745c5c3_Err != nil {
@@ -1098,14 +1098,14 @@ func displayEcVolumeStatus(volume dash.EcVolumeWithShards) templ.Component {
 					return templ_7745c5c3_Err
 				}
 			} else {
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 105, " <span class=\"badge bg-info\"><i class=\"fas fa-info-circle me-1\"></i>Minor Issues (")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 105, " <span class=\"badge bg-info\"><i class=\"bi bi-info-circle me-1\"></i>Minor Issues (")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
 				var templ_7745c5c3_Var36 string
 				templ_7745c5c3_Var36, templ_7745c5c3_Err = templ.JoinStringErrs(fmt.Sprintf("%d", len(volume.MissingShards)))
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `view/app/cluster_ec_volumes.templ`, Line: 589, Col: 138}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `view/app/cluster_ec_volumes.templ`, Line: 589, Col: 137}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var36))
 				if templ_7745c5c3_Err != nil {

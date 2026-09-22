@@ -5,16 +5,12 @@
 
 use std::fs::File;
 use std::io;
-#[cfg(not(unix))]
-use std::io::{Read, Seek, SeekFrom};
 
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
-use crate::pb::volume_server_pb::{
-    ChecksumAlgorithm, EcBitrotProtection, EcShardChecksums,
-};
+use crate::pb::volume_server_pb::{ChecksumAlgorithm, EcBitrotProtection, EcShardChecksums};
 use crate::storage::erasure_coding::ec_bitrot::{
-    self, ShardChecksumBuilder, DEFAULT_BITROT_BLOCK_SIZE,
+    self, DEFAULT_BITROT_BLOCK_SIZE, ShardChecksumBuilder,
 };
 use crate::storage::erasure_coding::ec_shard::*;
 use crate::storage::idx;
@@ -50,7 +46,7 @@ pub fn write_ec_files(
     let dat_size = dat_file.metadata()?.len() as i64;
 
     let rs = ReedSolomon::new(data_shards, parity_shards)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("reed-solomon init: {:?}", e)))?;
+        .map_err(|e| io::Error::other(format!("reed-solomon init: {:?}", e)))?;
 
     // Create shard files
     let total_shards = data_shards + parity_shards;
@@ -77,11 +73,13 @@ pub fn write_ec_files(
         &rs,
         &mut shards,
         &mut builders,
-        data_shards,
-        parity_shards,
-        ENCODE_BUFFER_SIZE,
-        block_size as usize,
-        block_size as usize,
+        EcEncodeLayout {
+            data_shards,
+            parity_shards,
+            buffer_size: ENCODE_BUFFER_SIZE,
+            large_block_size: block_size as usize,
+            small_block_size: block_size as usize,
+        },
     )?;
 
     // Close all shards
@@ -162,7 +160,7 @@ pub fn rebuild_ec_files(
     }
 
     let rs = ReedSolomon::new(data_shards, parity_shards)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("reed-solomon init: {:?}", e)))?;
+        .map_err(|e| io::Error::other(format!("reed-solomon init: {:?}", e)))?;
 
     let total_shards = data_shards + parity_shards;
     let mut shards: Vec<EcVolumeShard> = (0..total_shards as u8)
@@ -175,7 +173,7 @@ pub fn rebuild_ec_files(
     let mut shard_size = 0;
     for (i, shard) in shards.iter_mut().enumerate() {
         if !missing_shard_ids.contains(&(i as u32)) {
-            if let Ok(_) = shard.open() {
+            if shard.open().is_ok() {
                 let size = shard.file_size();
                 if size > shard_size {
                     shard_size = size;
@@ -185,7 +183,7 @@ pub fn rebuild_ec_files(
                 let mut found = false;
                 for &other_dir in additional_dirs {
                     let mut alt = EcVolumeShard::new(other_dir, collection, volume_id, i as u8);
-                    if let Ok(_) = alt.open() {
+                    if alt.open().is_ok() {
                         let size = alt.file_size();
                         if size > shard_size {
                             shard_size = size;
@@ -251,12 +249,8 @@ pub fn rebuild_ec_files(
         }
 
         // Reconstruct missing shards
-        rs.reconstruct(&mut buffers).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("reed-solomon reconstruct: {:?}", e),
-            )
-        })?;
+        rs.reconstruct(&mut buffers)
+            .map_err(|e| io::Error::other(format!("reed-solomon reconstruct: {:?}", e)))?;
 
         // Write recovered data into the missing shards
         for i in missing_shard_ids {
@@ -296,7 +290,7 @@ pub fn verify_ec_shards(
     parity_shards: usize,
 ) -> io::Result<(Vec<u32>, Vec<String>)> {
     let rs = ReedSolomon::new(data_shards, parity_shards)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("reed-solomon init: {:?}", e)))?;
+        .map_err(|e| io::Error::other(format!("reed-solomon init: {:?}", e)))?;
 
     let total_shards = data_shards + parity_shards;
     let mut shards: Vec<Option<EcVolumeShard>> = (0..total_shards)
@@ -378,27 +372,27 @@ pub fn verify_ec_shards(
         if !read_failed {
             // Need to convert Vec<Vec<u8>> to &[&[u8]] for rs.verify
             let slice_ptrs: Vec<&[u8]> = buffers.iter().map(|v| v.as_slice()).collect();
-            if let Ok(is_valid) = rs.verify(&slice_ptrs) {
-                if !is_valid {
-                    // Reed-Solomon verification failed. We cannot easily pinpoint which shard
-                    // is corrupted without recalculating parities or syndromes, so we just
-                    // log that this batch has corruption. Wait, we can test each parity shard!
-                    // Let's re-encode from the first `data_shards` and compare to the actual `parity_shards`.
+            if let Ok(is_valid) = rs.verify(&slice_ptrs)
+                && !is_valid
+            {
+                // Reed-Solomon verification failed. We cannot easily pinpoint which shard
+                // is corrupted without recalculating parities or syndromes, so we just
+                // log that this batch has corruption. Wait, we can test each parity shard!
+                // Let's re-encode from the first `data_shards` and compare to the actual `parity_shards`.
 
-                    let mut verify_buffers = buffers.clone();
-                    // Clear the parity parts
-                    for i in data_shards..total_shards {
-                        verify_buffers[i].fill(0);
-                    }
-                    if rs.encode(&mut verify_buffers).is_ok() {
-                        for i in 0..total_shards {
-                            if buffers[i] != verify_buffers[i] {
-                                broken_shards.insert(i as u32);
-                                details.push(format!(
-                                    "parity mismatch on shard {} at offset {}",
-                                    i, offset
-                                ));
-                            }
+                let mut verify_buffers = buffers.clone();
+                // Clear the parity parts
+                for buf in &mut verify_buffers[data_shards..total_shards] {
+                    buf.fill(0);
+                }
+                if rs.encode(&mut verify_buffers).is_ok() {
+                    for i in 0..total_shards {
+                        if buffers[i] != verify_buffers[i] {
+                            broken_shards.insert(i as u32);
+                            details.push(format!(
+                                "parity mismatch on shard {} at offset {}",
+                                i, offset
+                            ));
                         }
                     }
                 }
@@ -431,22 +425,23 @@ pub(crate) fn write_sorted_ecx_from_idx(idx_path: &str, ecx_path: &str) -> io::R
 
     // Read all idx entries
     let mut idx_file = File::open(idx_path)?;
-    let mut entries: Vec<(NeedleId, Offset, Size)> = Vec::new();
-
+    let mut last: std::collections::HashMap<NeedleId, (Offset, Size)> =
+        std::collections::HashMap::new();
     idx::walk_index_file(&mut idx_file, 0, |key, offset, size| {
-        entries.push((key, offset, size));
+        last.insert(key, (offset, size));
         Ok(())
     })?;
-
-    // Sort by NeedleId, then by actual offset so later entries come last
-    entries.sort_by_key(|&(key, offset, _)| (key, offset.to_actual_offset()));
-
-    // Remove duplicates (keep last/latest entry for each key).
-    // dedup_by_key keeps the first in each run, so we reverse first,
-    // dedup, then reverse back.
-    entries.reverse();
-    entries.dedup_by_key(|entry| entry.0);
-    entries.reverse();
+    let mut entries: Vec<(NeedleId, Offset, Size)> = last
+        .into_iter()
+        .filter_map(|(key, (offset, size))| {
+            if size.is_deleted() || offset.is_zero() {
+                None
+            } else {
+                Some((key, offset, size))
+            }
+        })
+        .collect();
+    entries.sort_by_key(|&(key, _o, _s)| key);
 
     // Write sorted entries to .ecx
     let mut ecx_file = File::create(ecx_path)?;
@@ -490,7 +485,7 @@ pub fn rebuild_ecx_file(
         .collect();
 
     for (i, shard) in shards.iter_mut().enumerate() {
-        if let Err(_) = shard.open() {
+        if shard.open().is_err() {
             let mut found = false;
             for &other_dir in additional_dirs {
                 let mut alt = EcVolumeShard::new(other_dir, collection, volume_id, i as u8);
@@ -507,7 +502,7 @@ pub fn rebuild_ecx_file(
                 }
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
-                    format!("cannot open data shard for ecx rebuild"),
+                    "cannot open data shard for ecx rebuild".to_string(),
                 ));
             }
         }
@@ -515,7 +510,7 @@ pub fn rebuild_ecx_file(
 
     // Determine total logical data size from shard sizes
     let shard_size = shards.iter().map(|s| s.file_size()).max().unwrap_or(0);
-    let total_data_size = shard_size as i64 * data_shards as i64;
+    let total_data_size = shard_size * data_shards as i64;
     // The volume's shard block layout: the .vif-recorded uniform block size,
     // or the legacy two-tier sizes when 0. The row count comes from the shard
     // length; -1 disambiguates a legacy shard that is an exact large-block
@@ -538,7 +533,7 @@ pub fn rebuild_ecx_file(
     let locate_shard_size = if dat_file_size > 0 {
         dat_file_size / data_shards as i64
     } else {
-        (shard_size as i64 - 1).max(0)
+        (shard_size - 1).max(0)
     };
 
     // Read version from superblock (first byte of logical data)
@@ -587,7 +582,8 @@ pub fn rebuild_ecx_file(
         }
 
         let cookie = Cookie::from_bytes(&header_buf[..COOKIE_SIZE]);
-        let needle_id = NeedleId::from_bytes(&header_buf[COOKIE_SIZE..COOKIE_SIZE + NEEDLE_ID_SIZE]);
+        let needle_id =
+            NeedleId::from_bytes(&header_buf[COOKIE_SIZE..COOKIE_SIZE + NEEDLE_ID_SIZE]);
         let size = Size::from_bytes(&header_buf[COOKIE_SIZE + NEEDLE_ID_SIZE..header_size]);
 
         // Validate: stop if we hit zero cookie+id (end of data)
@@ -640,7 +636,6 @@ pub fn rebuild_ecx_file(
 /// Read bytes from EC data shards at a logical offset in the .dat file,
 /// resolving the shard/offset through the volume's block layout via
 /// locate_data — the same mapping the read path uses.
-#[allow(clippy::too_many_arguments)]
 fn read_from_data_shards(
     shards: &[EcVolumeShard],
     buf: &mut [u8],
@@ -707,30 +702,50 @@ fn read_from_data_shards(
 /// the uniform block is.
 const ENCODE_BUFFER_SIZE: usize = 256 * 1024;
 
+/// Shape of one encode run: the Reed-Solomon split and the block sizes that
+/// fix where every byte of the .dat lands in the shards. Mirrors Go's
+/// `ECContext`. `buffer_size` must divide both block sizes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EcEncodeLayout {
+    pub(crate) data_shards: usize,
+    pub(crate) parity_shards: usize,
+    /// Bytes of each shard's block handled per sub-batch; bounds memory at
+    /// `total_shards * buffer_size` however large the blocks are.
+    pub(crate) buffer_size: usize,
+    pub(crate) large_block_size: usize,
+    pub(crate) small_block_size: usize,
+}
+
 /// Encode the .dat file data into shard files.
 ///
 /// Uses a two-phase approach matching Go's ec_encoder.go:
 /// 1. Process as many large blocks as possible
 /// 2. Process remaining data with small blocks
-///
-/// `buffer_size` must divide both block sizes.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_dat_file(
     dat_file: &File,
     dat_size: i64,
     rs: &ReedSolomon,
     shards: &mut [EcVolumeShard],
     builders: &mut [ShardChecksumBuilder],
-    data_shards: usize,
-    parity_shards: usize,
-    buffer_size: usize,
-    large_block_size: usize,
-    small_block_size: usize,
+    layout: EcEncodeLayout,
 ) -> io::Result<()> {
+    let EcEncodeLayout {
+        data_shards,
+        parity_shards,
+        buffer_size,
+        large_block_size,
+        small_block_size,
+    } = layout;
     let total_shards = data_shards + parity_shards;
-    let mut buffers: Vec<Vec<u8>> = (0..total_shards)
-        .map(|_| vec![0u8; buffer_size])
-        .collect();
+    let mut buffers: Vec<Vec<u8>> = (0..total_shards).map(|_| vec![0u8; buffer_size]).collect();
+    let mut run = EncodeRun {
+        dat_file,
+        rs,
+        buffers: &mut buffers,
+        shards,
+        builders,
+        data_shards,
+    };
 
     let mut remaining = dat_size;
     let mut offset: u64 = 0;
@@ -739,16 +754,7 @@ pub(crate) fn encode_dat_file(
     let large_row_size = large_block_size * data_shards;
 
     while remaining >= large_row_size as i64 {
-        encode_data(
-            dat_file,
-            offset,
-            large_block_size,
-            rs,
-            &mut buffers,
-            shards,
-            builders,
-            data_shards,
-        )?;
+        run.encode_row(offset, large_block_size)?;
         offset += large_row_size as u64;
         remaining -= large_row_size as i64;
     }
@@ -758,16 +764,7 @@ pub(crate) fn encode_dat_file(
 
     while remaining > 0 {
         let to_process = remaining.min(small_row_size as i64);
-        encode_data(
-            dat_file,
-            offset,
-            small_block_size,
-            rs,
-            &mut buffers,
-            shards,
-            builders,
-            data_shards,
-        )?;
+        run.encode_row(offset, small_block_size)?;
         offset += to_process as u64;
         remaining -= to_process;
     }
@@ -775,102 +772,73 @@ pub(crate) fn encode_dat_file(
     Ok(())
 }
 
-/// Encode one row of blocks, streaming it in ENCODE_BUFFER_SIZE sub-batches so
-/// arbitrarily large blocks never require block-sized allocations. Mirrors
-/// Go's encodeData.
-#[allow(clippy::too_many_arguments)]
-fn encode_data(
-    dat_file: &File,
-    row_offset: u64,
-    block_size: usize,
-    rs: &ReedSolomon,
-    buffers: &mut [Vec<u8>],
-    shards: &mut [EcVolumeShard],
-    builders: &mut [ShardChecksumBuilder],
+/// Everything one encode run streams through: the source .dat, the codec, a
+/// buffer per shard, and the per-shard file and checksum sinks.
+struct EncodeRun<'a> {
+    dat_file: &'a File,
+    rs: &'a ReedSolomon,
+    buffers: &'a mut [Vec<u8>],
+    shards: &'a mut [EcVolumeShard],
+    builders: &'a mut [ShardChecksumBuilder],
     data_shards: usize,
-) -> io::Result<()> {
-    let buffer_size = buffers[0].len();
-    if block_size % buffer_size != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "unexpected block size {} buffer size {}",
-                block_size, buffer_size
-            ),
-        ));
-    }
-    let batch_count = block_size / buffer_size;
-    for b in 0..batch_count {
-        encode_one_batch(
-            dat_file,
-            row_offset + (b * buffer_size) as u64,
-            block_size,
-            rs,
-            buffers,
-            shards,
-            builders,
-            data_shards,
-        )?;
-    }
-    Ok(())
 }
 
-/// Encode one sub-batch: the same buffer-sized slice of every shard's block in
-/// this row. Mirrors Go's encodeDataOneBatch.
-#[allow(clippy::too_many_arguments)]
-fn encode_one_batch(
-    dat_file: &File,
-    offset: u64,
-    block_size: usize,
-    rs: &ReedSolomon,
-    buffers: &mut [Vec<u8>],
-    shards: &mut [EcVolumeShard],
-    builders: &mut [ShardChecksumBuilder],
-    data_shards: usize,
-) -> io::Result<()> {
-    // Read data shards from the .dat file, zero-filling past EOF — the buffers
-    // are reused across batches, so the tail must be cleared explicitly.
-    for i in 0..data_shards {
-        let read_offset = offset + (i * block_size) as u64;
-        let n = read_at_most(dat_file, &mut buffers[i], read_offset)?;
-        for b in buffers[i][n..].iter_mut() {
-            *b = 0;
+impl EncodeRun<'_> {
+    /// Encode one row of blocks, streaming it in ENCODE_BUFFER_SIZE sub-batches
+    /// so arbitrarily large blocks never require block-sized allocations.
+    /// Mirrors Go's encodeData.
+    fn encode_row(&mut self, row_offset: u64, block_size: usize) -> io::Result<()> {
+        let buffer_size = self.buffers[0].len();
+        if !block_size.is_multiple_of(buffer_size) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unexpected block size {} buffer size {}",
+                    block_size, buffer_size
+                ),
+            ));
         }
+        let batch_count = block_size / buffer_size;
+        for b in 0..batch_count {
+            self.encode_one_batch(row_offset + (b * buffer_size) as u64, block_size)?;
+        }
+        Ok(())
     }
 
-    // Encode parity shards
-    rs.encode(&mut *buffers).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("reed-solomon encode: {:?}", e),
-        )
-    })?;
+    /// Encode one sub-batch: the same buffer-sized slice of every shard's block
+    /// in this row. Mirrors Go's encodeDataOneBatch.
+    fn encode_one_batch(&mut self, offset: u64, block_size: usize) -> io::Result<()> {
+        // Read data shards from the .dat file, zero-filling past EOF — the
+        // buffers are reused across batches, so the tail must be cleared
+        // explicitly.
+        for (i, buf) in self.buffers[..self.data_shards].iter_mut().enumerate() {
+            let read_offset = offset + (i * block_size) as u64;
+            let n = read_at_most(self.dat_file, buf, read_offset)?;
+            buf[n..].fill(0);
+        }
 
-    // Write all shard buffers to files and feed the same bytes to each
-    // shard's bitrot checksum builder, keeping covered_size == on-disk length.
-    for (i, buf) in buffers.iter().enumerate() {
-        shards[i].write_all(buf)?;
-        builders[i].write(buf);
+        // Encode parity shards
+        self.rs
+            .encode(&mut *self.buffers)
+            .map_err(|e| io::Error::other(format!("reed-solomon encode: {:?}", e)))?;
+
+        // Write all shard buffers to files and feed the same bytes to each
+        // shard's bitrot checksum builder, keeping covered_size == on-disk
+        // length.
+        for (i, buf) in self.buffers.iter().enumerate() {
+            self.shards[i].write_all(buf)?;
+            self.builders[i].write(buf);
+        }
+
+        Ok(())
     }
-
-    Ok(())
 }
 
 /// Read into `buf` at `offset` until it is full or EOF; returns bytes read.
 fn read_at_most(dat_file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     let mut n = 0;
     while n < buf.len() {
-        #[cfg(unix)]
-        let r = {
-            use std::os::unix::fs::FileExt;
-            dat_file.read_at(&mut buf[n..], offset + n as u64)?
-        };
-        #[cfg(not(unix))]
-        let r = {
-            let mut f = dat_file.try_clone()?;
-            f.seek(SeekFrom::Start(offset + n as u64))?;
-            f.read(&mut buf[n..])?
-        };
+        let r = crate::storage::io::read_at(dat_file, &mut buf[n..], offset + n as u64)?;
         if r == 0 {
             break;
         }
@@ -884,7 +852,7 @@ mod tests {
     use super::*;
     use crate::storage::needle::needle::Needle;
     use crate::storage::needle_map::NeedleMapKind;
-    use crate::storage::volume::Volume;
+    use crate::storage::volume::{Volume, VolumeSpec};
     use tempfile::TempDir;
 
     #[test]
@@ -896,13 +864,9 @@ mod tests {
         let mut v = Volume::new(
             dir,
             dir,
-            "",
             VolumeId(1),
             NeedleMapKind::InMemory,
-            None,
-            None,
-            0,
-            Version::current(),
+            &VolumeSpec::default(),
         )
         .unwrap();
 
@@ -947,13 +911,9 @@ mod tests {
         let mut v = Volume::new(
             dir,
             dir,
-            "",
             VolumeId(1),
             NeedleMapKind::InMemory,
-            None,
-            None,
-            0,
-            Version::current(),
+            &VolumeSpec::default(),
         )
         .unwrap();
         for i in 1..=n {
@@ -1026,13 +986,9 @@ mod tests {
         let mut v = Volume::new(
             &dir,
             &dir,
-            "",
             VolumeId(1),
             NeedleMapKind::InMemory,
-            None,
-            None,
-            0,
-            Version::current(),
+            &VolumeSpec::default(),
         )
         .unwrap();
         for i in 1..=20 {
@@ -1064,7 +1020,10 @@ mod tests {
         let victim = format!("{}/1.ec03", dir);
         let full = std::fs::metadata(&victim).unwrap().len();
         assert!(full > 0, "encoded shard should be non-empty");
-        let f = std::fs::OpenOptions::new().write(true).open(&victim).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&victim)
+            .unwrap();
         f.set_len(full / 2).unwrap();
         drop(f);
 
@@ -1218,19 +1177,15 @@ mod tests {
     #[test]
     fn test_rebuild_ecx_file_uniform_layout() {
         use crate::storage::needle_map::NeedleMapKind;
-        use crate::storage::volume::Volume;
+        use crate::storage::volume::{Volume, VolumeSpec};
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_str().unwrap().to_string();
         let mut v = Volume::new(
             &dir,
             &dir,
-            "",
             VolumeId(2),
             NeedleMapKind::InMemory,
-            None,
-            None,
-            0,
-            Version::current(),
+            &VolumeSpec::default(),
         )
         .unwrap();
         for i in 1u64..=12 {
@@ -1260,7 +1215,10 @@ mod tests {
 
         rebuild_ecx_file(&dir, "", VolumeId(2), 10, block_size, 0, &[]).unwrap();
         let rebuilt = std::fs::read(&ecx_path).unwrap();
-        assert_eq!(canonical, rebuilt, "rebuilt .ecx must match the encode-time .ecx");
+        assert_eq!(
+            canonical, rebuilt,
+            "rebuilt .ecx must match the encode-time .ecx"
+        );
     }
 
     // A truncated data shard must FAIL the .ecx rebuild, not publish the
@@ -1268,19 +1226,15 @@ mod tests {
     #[test]
     fn test_rebuild_ecx_file_fails_on_truncated_shard() {
         use crate::storage::needle_map::NeedleMapKind;
-        use crate::storage::volume::Volume;
+        use crate::storage::volume::{Volume, VolumeSpec};
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_str().unwrap().to_string();
         let mut v = Volume::new(
             &dir,
             &dir,
-            "",
             VolumeId(3),
             NeedleMapKind::InMemory,
-            None,
-            None,
-            0,
-            Version::current(),
+            &VolumeSpec::default(),
         )
         .unwrap();
         for i in 1u64..=12 {
@@ -1378,13 +1332,9 @@ mod tests {
         let mut v = Volume::new(
             dat_dir,
             idx_dir,
-            "",
             VolumeId(1),
             NeedleMapKind::InMemory,
-            None,
-            None,
-            0,
-            Version::current(),
+            &VolumeSpec::default(),
         )
         .unwrap();
 
@@ -1462,13 +1412,9 @@ mod tests {
         let mut v = Volume::new(
             dat_dir,
             idx_dir,
-            "",
             VolumeId(1),
             NeedleMapKind::InMemory,
-            None,
-            None,
-            0,
-            Version::current(),
+            &VolumeSpec::default(),
         )
         .unwrap();
 
@@ -1500,13 +1446,9 @@ mod tests {
         let mut v = Volume::new(
             dir,
             dir,
-            "",
             vid,
             NeedleMapKind::InMemory,
-            None,
-            None,
-            0,
-            Version::current(),
+            &VolumeSpec::default(),
         )
         .unwrap();
         for i in 1..=8 {
@@ -1595,6 +1537,88 @@ mod tests {
             details.iter().any(|d| d.contains("not mounted")),
             "an unmounted shard must be distinguished from an unopenable one, got {:?}",
             details
+        );
+    }
+
+    #[test]
+    fn test_encode_drops_tombstone_last_wins() {
+        use crate::storage::idx;
+        use crate::storage::types::{NeedleId, Offset, Size, TOMBSTONE_FILE_SIZE};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let idx_path = format!("{}/t.idx", dir);
+        let ecx_path = format!("{}/t.ecx", dir);
+        let key = NeedleId(12345);
+        {
+            let mut f = std::fs::File::create(&idx_path).unwrap();
+            idx::write_index_entry(&mut f, key, Offset::from_actual_offset(1024), Size(100))
+                .unwrap();
+            idx::write_index_entry(&mut f, key, Offset::default(), TOMBSTONE_FILE_SIZE).unwrap();
+        }
+        super::write_sorted_ecx_from_idx(&idx_path, &ecx_path).unwrap();
+        let mut found = false;
+        {
+            let mut f = std::fs::File::open(&ecx_path).unwrap();
+            idx::walk_index_file(&mut f, 0, |k, _o, _s| {
+                if k == key {
+                    found = true;
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert!(!found, "tombstoned key must not appear in .ecx");
+        let idx2 = format!("{}/t2.idx", dir);
+        let ecx2 = format!("{}/t2.ecx", dir);
+        {
+            let mut f = std::fs::File::create(&idx2).unwrap();
+            idx::write_index_entry(&mut f, key, Offset::default(), TOMBSTONE_FILE_SIZE).unwrap();
+            idx::write_index_entry(&mut f, key, Offset::from_actual_offset(2048), Size(200))
+                .unwrap();
+        }
+        super::write_sorted_ecx_from_idx(&idx2, &ecx2).unwrap();
+        let mut found2 = false;
+        {
+            let mut f = std::fs::File::open(&ecx2).unwrap();
+            idx::walk_index_file(&mut f, 0, |k, o, s| {
+                if k == key {
+                    found2 = true;
+                    assert_eq!(o.to_actual_offset(), 2048);
+                    assert_eq!(s, Size(200));
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert!(found2, "re-created key must appear live");
+        // Zero offset with non-negative size is also a deletion: Go
+        // readNeedleMap (`if !offset.IsZero() && !size.IsDeleted() { Set }
+        // else { Delete }`) and CompactNeedleMap::load_from_idx both treat
+        // it as deleted. Encode must drop it too, or the .ecx live-map
+        // mismatches replay.
+        let idx3 = format!("{}/t3.idx", dir);
+        let ecx3 = format!("{}/t3.ecx", dir);
+        {
+            let mut f = std::fs::File::create(&idx3).unwrap();
+            idx::write_index_entry(&mut f, key, Offset::from_actual_offset(1024), Size(100))
+                .unwrap();
+            idx::write_index_entry(&mut f, key, Offset::default(), Size(0)).unwrap();
+        }
+        super::write_sorted_ecx_from_idx(&idx3, &ecx3).unwrap();
+        let mut found3 = false;
+        {
+            let mut f = std::fs::File::open(&ecx3).unwrap();
+            idx::walk_index_file(&mut f, 0, |k, _o, _s| {
+                if k == key {
+                    found3 = true;
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert!(
+            !found3,
+            "zero-offset row must not appear in .ecx even with non-negative size"
         );
     }
 }
