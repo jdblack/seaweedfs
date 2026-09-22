@@ -1,0 +1,101 @@
+# fork: the image contents upstream's docker/Dockerfile.go_build produces, built
+# from this working tree.
+#
+# Why a copy instead of his file: Dockerfile.go_build runs
+# `git clone https://github.com/seaweedfs/seaweedfs` and checks out BRANCH, so it
+# can only ever build upstream's tree. This file reproduces its final image
+# instead, and differs in exactly two ways, both deliberate:
+#
+#   1. The Go binary arrives pre-built: deploy_image.sh cross-compiles it with the
+#      same settings upstream's builder stage uses (-tags "$TAGS", CGO_ENABLED=0,
+#      -ldflags "-s -w -extldflags -static -X .../version.COMMIT=<short sha>").
+#   2. The two Rust binaries are taken pre-built or not at all. There is no cargo
+#      fallback for weed-volume because no Rust toolchain is available here and
+#      seaweed-worker/ pins rust-version 1.94.1. Upstream treats the worker that
+#      way itself ("taken pre-built or not at all"); a missing file becomes the
+#      same zero-byte placeholder its rust_builder writes, which the chart's
+#      lance container refuses to exec.
+#
+# Everything else is verbatim: the alpine final stage, its apk line (libgcc /
+# libcrypto3 / libssl3 are what the Rust binaries link), the seaweed user,
+# entrypoint, filer.toml, EXPOSEs, VOLUME/WORKDIR and CMD mini -dir=/data.
+#
+# Mirrors upstream 559ec3349. Re-diff on every merge; only the two points above
+# may differ. Staged inputs, written by deploy_image.sh into this build context:
+#   weed-worker-prebuilt/weed-worker-${TARGETARCH}
+#   weed-volume-prebuilt/weed-volume-${TARGETARCH}
+
+FROM alpine:3.23 AS rust-bins
+ARG TARGETARCH
+COPY weed-worker-prebuilt/ /prebuilt-worker/
+COPY weed-volume-prebuilt/ /prebuilt-volume/
+RUN if [ -f "/prebuilt-worker/weed-worker-${TARGETARCH}" ]; then \
+      echo "Using pre-built Rust worker for ${TARGETARCH}" && \
+      cp "/prebuilt-worker/weed-worker-${TARGETARCH}" /weed-worker; \
+    else \
+      echo "No pre-built Rust worker for ${TARGETARCH}, leaving the placeholder" && \
+      touch /weed-worker; \
+    fi && \
+    if [ -f "/prebuilt-volume/weed-volume-${TARGETARCH}" ]; then \
+      echo "Using pre-built Rust volume server for ${TARGETARCH}" && \
+      cp "/prebuilt-volume/weed-volume-${TARGETARCH}" /weed-volume; \
+    else \
+      echo "No pre-built Rust volume server for ${TARGETARCH}, leaving the placeholder" && \
+      touch /weed-volume; \
+    fi && \
+    chmod 0755 /weed-volume /weed-worker
+
+FROM alpine AS final
+LABEL author="Chris Lu"
+COPY ./weed /usr/bin/weed
+# Rust volume server (real binary on amd64/arm64, empty placeholder on other platforms)
+COPY --from=rust-bins /weed-volume /usr/bin/weed-volume
+# Same for the Rust maintenance worker, which serves Lance table buckets
+COPY --from=rust-bins /weed-worker /usr/bin/weed-worker
+RUN chmod +x /usr/bin/weed
+RUN mkdir -p /etc/seaweedfs
+COPY ./filer.toml /etc/seaweedfs/filer.toml
+COPY ./entrypoint.sh /entrypoint.sh
+
+# FIPS 140-3 mode is ON by default (Go 1.24+)
+# To disable: docker run -e GODEBUG=fips140=off ...
+
+# Install dependencies and create non-root user
+RUN apk upgrade --no-cache && \
+    apk add --no-cache fuse curl su-exec libgcc libcrypto3 libssl3 && \
+    addgroup -g 1000 seaweed && \
+    adduser -D -u 1000 -G seaweed seaweed
+
+# volume server grpc port
+EXPOSE 18080
+# volume server http port
+EXPOSE 8080
+# filer server grpc port
+EXPOSE 18888
+# filer server http port
+EXPOSE 8888
+# master server shared grpc port
+EXPOSE 19333
+# master server shared http port
+EXPOSE 9333
+# s3 server http port
+EXPOSE 8333
+# webdav server http port
+EXPOSE 7333
+
+# Create data directory and set proper ownership for seaweed user
+RUN mkdir -p /data/filerldb2 && \
+    chown -R seaweed:seaweed /data && \
+    chown -R seaweed:seaweed /etc/seaweedfs && \
+    chmod 755 /entrypoint.sh
+
+VOLUME /data
+WORKDIR /data
+
+# Entrypoint will handle permission fixes and user switching
+ENTRYPOINT ["/entrypoint.sh"]
+# Default to a complete single-process cluster (master+volume+filer+S3+admin)
+# so the image is usable out of the box — including in environments like
+# GitHub Actions service containers that cannot pass arguments to the entrypoint.
+# Override with any other subcommand at `docker run` / compose time.
+CMD ["mini", "-dir=/data"]
