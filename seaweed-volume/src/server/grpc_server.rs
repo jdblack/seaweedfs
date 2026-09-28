@@ -3090,16 +3090,44 @@ impl VolumeServer for VolumeGrpcService {
             )
         };
 
-        // Check existing .vif for EC shard config (matching Go's MaybeLoadVolumeInfo).
-        // The block size is recomputed by the encode for the current .dat, so
-        // only the ratio is carried over from a prior config.
-        let (data_shards, parity_shards, _) =
-            crate::storage::erasure_coding::ec_volume::read_ec_shard_config(
-                &dir, &idx_dir, collection, vid,
-            )
-            .map_err(|e| {
-                tonic::Status::internal(format!("read ec shard config for volume {}: {}", vid.0, e))
-            })?;
+        // fork: resolve the layout to encode with, matching the Go volume server
+        // and the enterprise edition — the caller's requested EcShardConfig first
+        // (the cluster's EC ratio policy), then a .vif left by an earlier encode,
+        // then the build default. A requested layout that cannot be a real EC
+        // volume is an error rather than a silent fallback: encoding at a ratio
+        // nobody asked for is the failure this field exists to prevent.
+        // The block size is recomputed by the encode for the current .dat, so only
+        // the ratio is carried over from a prior config.
+        let (data_shards, parity_shards) = match req.ec_shard_config.as_ref() {
+            Some(cfg) if cfg.data_shards != 0 || cfg.parity_shards != 0 => {
+                let ds = cfg.data_shards;
+                let ps = cfg.parity_shards;
+                let max_shard_count =
+                    crate::storage::erasure_coding::ec_shard::MAX_SHARD_COUNT as u64;
+                if ds == 0 || ps == 0 || ds as u64 + ps as u64 > max_shard_count {
+                    return Err(Status::invalid_argument(format!(
+                        "volume {}: invalid requested EC config {}+{} (both counts must be \
+                         positive and the total must not exceed {})",
+                        vid.0, ds, ps, max_shard_count
+                    )));
+                }
+                (ds, ps)
+            }
+            _ => {
+                // Check existing .vif for EC shard config (matching Go's MaybeLoadVolumeInfo).
+                let (ds, ps, _) =
+                    crate::storage::erasure_coding::ec_volume::read_ec_shard_config(
+                        &dir, &idx_dir, collection, vid,
+                    )
+                    .map_err(|e| {
+                        tonic::Status::internal(format!(
+                            "read ec shard config for volume {}: {}",
+                            vid.0, e
+                        ))
+                    })?;
+                (ds, ps)
+            }
+        };
 
         let block_size = match crate::storage::erasure_coding::ec_encoder::write_ec_files(
             &dir,
@@ -7742,6 +7770,7 @@ mod tests {
                 volume_server_pb::VolumeEcShardsGenerateRequest {
                     volume_id: 1,
                     collection: "ttl".to_string(),
+                    ..Default::default()
                 },
             ))
             .await
@@ -7754,8 +7783,115 @@ mod tests {
         assert!(vif.expire_at_sec <= before + ttl.to_seconds() + 5);
     }
 
-    /// REGRESSION: a node-wide scrub must survive a volume that legitimately
-    /// disappears while it runs.
+    /// The caller's requested layout is the cluster's EC ratio policy: it must be
+    /// the one encoded, and it must be what the .vif records, so holders and the
+    /// Go side agree on the layout afterwards.
+    #[tokio::test]
+    async fn test_volume_ec_shards_generate_uses_requested_ec_config() {
+        let (service, tmp) = make_local_service_with_volume("ecpolicy", None);
+
+        service
+            .volume_ec_shards_generate(Request::new(
+                volume_server_pb::VolumeEcShardsGenerateRequest {
+                    volume_id: 1,
+                    collection: "ecpolicy".to_string(),
+                    ec_shard_config: Some(volume_server_pb::EcShardConfig {
+                        data_shards: 3,
+                        parity_shards: 2,
+                        ..Default::default()
+                    }),
+                },
+            ))
+            .await
+            .expect("a valid requested layout must be encoded");
+
+        for shard_id in 0..5 {
+            let path = tmp.path().join(format!("ecpolicy_1.ec{:02}", shard_id));
+            assert!(path.exists(), "requested 3+2 must produce {}", path.display());
+        }
+        assert!(
+            !tmp.path().join("ecpolicy_1.ec05").exists(),
+            "3+2 has five shards: nothing beyond id 4 may be written"
+        );
+
+        let vif: crate::storage::volume::VifVolumeInfo = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join("ecpolicy_1.vif")).unwrap(),
+        )
+        .unwrap();
+        let cfg = vif.ec_shard_config.expect(".vif carries the layout");
+        assert_eq!((cfg.data_shards, cfg.parity_shards), (3, 2));
+    }
+
+    /// No requested layout keeps the previous behavior: the build default.
+    #[tokio::test]
+    async fn test_volume_ec_shards_generate_without_request_uses_default() {
+        let (service, tmp) = make_local_service_with_volume("ecdefault", None);
+
+        service
+            .volume_ec_shards_generate(Request::new(
+                volume_server_pb::VolumeEcShardsGenerateRequest {
+                    volume_id: 1,
+                    collection: "ecdefault".to_string(),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .unwrap();
+
+        assert!(tmp.path().join("ecdefault_1.ec13").exists());
+        assert!(!tmp.path().join("ecdefault_1.ec14").exists());
+
+        let vif: crate::storage::volume::VifVolumeInfo = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join("ecdefault_1.vif")).unwrap(),
+        )
+        .unwrap();
+        let cfg = vif.ec_shard_config.expect(".vif carries the layout");
+        assert_eq!(
+            (cfg.data_shards, cfg.parity_shards),
+            (
+                crate::storage::erasure_coding::ec_shard::DATA_SHARDS_COUNT as u32,
+                crate::storage::erasure_coding::ec_shard::PARITY_SHARDS_COUNT as u32
+            )
+        );
+    }
+
+    /// An impossible requested layout is rejected before anything is written: a
+    /// volume encoded at a ratio nobody asked for is the failure this field
+    /// exists to prevent.
+    #[tokio::test]
+    async fn test_volume_ec_shards_generate_rejects_invalid_requested_ec_config() {
+        for (ds, ps) in [(0u32, 2u32), (3, 0), (32, 1)] {
+            let (service, tmp) = make_local_service_with_volume("ecbad", None);
+
+            let err = service
+                .volume_ec_shards_generate(Request::new(
+                    volume_server_pb::VolumeEcShardsGenerateRequest {
+                        volume_id: 1,
+                        collection: "ecbad".to_string(),
+                        ec_shard_config: Some(volume_server_pb::EcShardConfig {
+                            data_shards: ds,
+                            parity_shards: ps,
+                            ..Default::default()
+                        }),
+                    },
+                ))
+                .await
+                .expect_err("an impossible layout must be rejected");
+
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{}+{}", ds, ps);
+            assert!(
+                err.message().contains("invalid requested EC config"),
+                "got: {}",
+                err.message()
+            );
+            assert!(
+                !tmp.path().join("ecbad_1.ec00").exists(),
+                "a rejected request must not leave shards behind"
+            );
+        }
+    }
+
+
     ///
     /// Nothing is held across the scan, so the volume set changes under the
     /// loop: the heartbeat drops a volume that reported an I/O error, and a
@@ -7823,6 +7959,7 @@ mod tests {
                 volume_server_pb::VolumeEcShardsGenerateRequest {
                     volume_id: 1,
                     collection: String::new(),
+                    ..Default::default()
                 },
             ))
             .await
@@ -7906,6 +8043,7 @@ mod tests {
                 volume_server_pb::VolumeEcShardsGenerateRequest {
                     volume_id: 1,
                     collection: String::new(),
+                    ..Default::default()
                 },
             ))
             .await
@@ -7979,6 +8117,7 @@ mod tests {
                 volume_server_pb::VolumeEcShardsGenerateRequest {
                     volume_id: 1,
                     collection: String::new(),
+                    ..Default::default()
                 },
             ))
             .await
@@ -8015,6 +8154,7 @@ mod tests {
                 volume_server_pb::VolumeEcShardsGenerateRequest {
                     volume_id: 1,
                     collection: String::new(),
+                    ..Default::default()
                 },
             ))
             .await

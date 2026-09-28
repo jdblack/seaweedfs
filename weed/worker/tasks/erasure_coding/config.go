@@ -21,8 +21,10 @@ type Config struct {
 	ReplicaPlacement string   `json:"replica_placement"` // e.g. "020"; empty falls back to the master default replication
 	// fork: configurable EC ratio; resolvers live in ec_ratio_fork.go
 	// DataShards and ParityShards are the Reed-Solomon ratio used for new
-	// encodes. A value <= 0 keeps the build default (erasure_coding.DataShardsCount /
-	// erasure_coding.ParityShardsCount), so an unset config behaves as before.
+	// encodes. A value <= 0 means "inherit": the cluster's EC ratio policy
+	// (ec.config) for the collection, else the build default
+	// (erasure_coding.DataShardsCount / ParityShardsCount). An explicit value here
+	// overrides the policy.
 	DataShards   int `json:"data_shards"`
 	ParityShards int `json:"parity_shards"`
 }
@@ -40,8 +42,10 @@ func NewDefaultConfig() *Config {
 		CollectionFilter: "",
 		MinSizeMB:        30, // 30MB (more reasonable than 100MB)
 		PreferredTags:    nil,
-		DataShards:       erasure_coding.DataShardsCount,
-		ParityShards:     erasure_coding.ParityShardsCount,
+		// fork: 0 means inherit the cluster's EC ratio policy (ec.config), else the
+		// build default; an explicit value overrides the policy.
+		DataShards:   0,
+		ParityShards: 0,
 	}
 }
 
@@ -184,13 +188,13 @@ func GetConfigSpec() base.ConfigSpec {
 				Name:         "data_shards",
 				JSONName:     "data_shards",
 				Type:         config.FieldTypeInt,
-				DefaultValue: erasure_coding.DataShardsCount,
-				MinValue:     1,
+				DefaultValue: 0,
+				MinValue:     0,
 				MaxValue:     erasure_coding.MaxShardCount - 1,
 				Required:     false,
 				DisplayName:  "Data Shards",
 				Description:  "Number of Reed-Solomon data shards for each new EC volume",
-				HelpText:     "Each volume is split into this many data shards. Data plus parity must not exceed the maximum shard count (32). A value of 0 uses the build default",
+				HelpText:     "Each volume is split into this many data shards. Data plus parity must not exceed the maximum shard count (32). 0 inherits the cluster EC policy (ec.config), or the build default when no policy applies",
 				Placeholder:  fmt.Sprint(erasure_coding.DataShardsCount),
 				Unit:         config.UnitCount,
 				InputType:    "number",
@@ -200,13 +204,13 @@ func GetConfigSpec() base.ConfigSpec {
 				Name:         "parity_shards",
 				JSONName:     "parity_shards",
 				Type:         config.FieldTypeInt,
-				DefaultValue: erasure_coding.ParityShardsCount,
-				MinValue:     1,
+				DefaultValue: 0,
+				MinValue:     0,
 				MaxValue:     erasure_coding.MaxShardCount - 1,
 				Required:     false,
 				DisplayName:  "Parity Shards",
 				Description:  "Number of Reed-Solomon parity shards for each new EC volume",
-				HelpText:     "How many shards can be lost without data loss. Data plus parity must not exceed the maximum shard count (32). A value of 0 uses the build default",
+				HelpText:     "How many shards can be lost without data loss. Data plus parity must not exceed the maximum shard count (32). 0 inherits the cluster EC policy (ec.config), or the build default when no policy applies",
 				Placeholder:  fmt.Sprint(erasure_coding.ParityShardsCount),
 				Unit:         config.UnitCount,
 				InputType:    "number",

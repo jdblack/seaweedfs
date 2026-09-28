@@ -243,8 +243,10 @@ func Detection(ctx context.Context, metrics []*types.VolumeHealthMetrics, cluste
 				}
 
 				glog.Infof("EC Detection: ActiveTopology available, planning destinations for volume %d", metric.VolumeID)
-				dataShards := ecConfig.ResolveDataShards()
-				parityShards := ecConfig.ResolveParityShards()
+				// fork: the collection's EC ratio policy (ec.config) decides the
+				// proposed layout when the job config leaves the ratio unset.
+				dataShards := ecConfig.ResolveDataShardsFor(metric.Collection)
+				parityShards := ecConfig.ResolveParityShardsFor(metric.Collection)
 				multiPlan, shardsPerPlan, err := planECDestinations(ecSnapshot, nodeAddresses, metric, ecConfig, replicaPlacement, dataShards, parityShards)
 				if err != nil {
 					glog.V(2).Infof("Failed to plan EC destinations for volume %d: %v", metric.VolumeID, err)

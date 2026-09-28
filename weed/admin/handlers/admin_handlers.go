@@ -30,6 +30,7 @@ type AdminHandlers struct {
 	mqHandlers             *MessageQueueHandlers
 	serviceAccountHandlers *ServiceAccountHandlers
 	groupHandlers          *GroupHandlers
+	ecConfigHandlers       *ECConfigHandlers
 }
 
 // NewAdminHandlers creates a new instance of AdminHandlers
@@ -43,6 +44,7 @@ func NewAdminHandlers(adminServer *dash.AdminServer, store sessions.Store) *Admi
 	mqHandlers := NewMessageQueueHandlers(adminServer)
 	serviceAccountHandlers := NewServiceAccountHandlers(adminServer)
 	groupHandlers := NewGroupHandlers(adminServer)
+	ecConfigHandlers := NewECConfigHandlers(adminServer)
 	return &AdminHandlers{
 		adminServer:            adminServer,
 		sessionStore:           store,
@@ -55,6 +57,7 @@ func NewAdminHandlers(adminServer *dash.AdminServer, store sessions.Store) *Admi
 		mqHandlers:             mqHandlers,
 		serviceAccountHandlers: serviceAccountHandlers,
 		groupHandlers:          groupHandlers,
+		ecConfigHandlers:       ecConfigHandlers,
 	}
 }
 
@@ -137,6 +140,8 @@ func (h *AdminHandlers) registerUIRoutes(r *mux.Router) {
 	r.HandleFunc("/storage/collections/{name}", h.clusterHandlers.ShowCollectionDetails).Methods(http.MethodGet)
 	r.HandleFunc("/storage/ec-shards", h.clusterHandlers.ShowClusterEcShards).Methods(http.MethodGet)
 	r.HandleFunc("/storage/ec-volumes/{id}", h.clusterHandlers.ShowEcVolumeDetails).Methods(http.MethodGet)
+	// fork: the EC ratio policy page (mirrors the enterprise edition's route)
+	r.HandleFunc("/storage/ec-config", h.ecConfigHandlers.ShowECConfig).Methods(http.MethodGet)
 
 	// Message Queue management routes
 	r.HandleFunc("/mq/brokers", h.mqHandlers.ShowBrokers).Methods(http.MethodGet)
@@ -266,6 +271,13 @@ func (h *AdminHandlers) registerAPIRoutes(api *mux.Router, enforceWrite bool) {
 	volumeApi.HandleFunc("/export", h.clusterHandlers.ExportClusterVolumes).Methods(http.MethodGet)
 	volumeApi.Handle("/{id}/{server}/vacuum", wrapWrite(h.clusterHandlers.VacuumVolume)).Methods(http.MethodPost)
 	volumeApi.Handle("/{id}/{server}/read-only", wrapWrite(h.clusterHandlers.SetVolumeReadOnly)).Methods(http.MethodPost)
+
+	// fork: EC ratio policy (ec.config) read/write, persisted in the filer
+	api.HandleFunc("/ec/config", h.ecConfigHandlers.GetECConfigAPI).Methods(http.MethodGet)
+	api.Handle("/ec/config/global", wrapWrite(h.ecConfigHandlers.SetGlobalECConfigAPI)).Methods(http.MethodPost)
+	api.Handle("/ec/config/global/delete", wrapWrite(h.ecConfigHandlers.DeleteGlobalECConfigAPI)).Methods(http.MethodPost)
+	api.Handle("/ec/config/collection", wrapWrite(h.ecConfigHandlers.SetCollectionECConfigAPI)).Methods(http.MethodPost)
+	api.Handle("/ec/config/collection/delete", wrapWrite(h.ecConfigHandlers.DeleteCollectionECConfigAPI)).Methods(http.MethodPost)
 
 	pluginApi := api.PathPrefix("/plugin").Subrouter()
 	pluginApi.HandleFunc("/status", h.adminServer.GetPluginStatusAPI).Methods(http.MethodGet)

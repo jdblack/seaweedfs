@@ -149,21 +149,21 @@ func (h *ErasureCodingHandler) Descriptor() *plugin_pb.JobTypeDescriptor {
 						{
 							Name:        "data_shards",
 							Label:       "Data Shards",
-							Description: "Reed-Solomon data shards for each new EC volume. Must be >= 1; data + parity must not exceed 32.",
+							Description: "Reed-Solomon data shards for each new EC volume. 0 inherits the cluster EC policy (ec.config), else the build default; data + parity must not exceed 32.",
 							FieldType:   plugin_pb.ConfigFieldType_CONFIG_FIELD_TYPE_INT64,
 							Widget:      plugin_pb.ConfigWidget_CONFIG_WIDGET_NUMBER,
 							Required:    true,
-							MinValue:    &plugin_pb.ConfigValue{Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: 1}},
+							MinValue:    &plugin_pb.ConfigValue{Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: 0}},
 							MaxValue:    &plugin_pb.ConfigValue{Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: int64(ecstorage.MaxShardCount - 1)}},
 						},
 						{
 							Name:        "parity_shards",
 							Label:       "Parity Shards",
-							Description: "Reed-Solomon parity shards for each new EC volume. Must be >= 1; data + parity must not exceed 32.",
+							Description: "Reed-Solomon parity shards for each new EC volume. 0 inherits the cluster EC policy (ec.config), else the build default; data + parity must not exceed 32.",
 							FieldType:   plugin_pb.ConfigFieldType_CONFIG_FIELD_TYPE_INT64,
 							Widget:      plugin_pb.ConfigWidget_CONFIG_WIDGET_NUMBER,
 							Required:    true,
-							MinValue:    &plugin_pb.ConfigValue{Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: 1}},
+							MinValue:    &plugin_pb.ConfigValue{Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: 0}},
 							MaxValue:    &plugin_pb.ConfigValue{Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: int64(ecstorage.MaxShardCount - 1)}},
 						},
 					},
@@ -186,10 +186,10 @@ func (h *ErasureCodingHandler) Descriptor() *plugin_pb.JobTypeDescriptor {
 					Kind: &plugin_pb.ConfigValue_StringValue{StringValue: ""},
 				},
 				"data_shards": {
-					Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: int64(ecstorage.DataShardsCount)},
+					Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: 0},
 				},
 				"parity_shards": {
-					Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: int64(ecstorage.ParityShardsCount)},
+					Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: 0},
 				},
 			},
 		},
@@ -238,6 +238,11 @@ func (h *ErasureCodingHandler) Detect(
 	}
 
 	workerConfig := deriveErasureCodingWorkerConfig(request.GetWorkerConfigValues())
+
+	// fork: the cluster's EC ratio policy decides the layout detection proposes
+	// for a volume whose job config leaves the ratio unset (ec.config). Load it
+	// from the filer in the cluster context before planning.
+	syncECPolicyFromCluster(request.ClusterContext, h.grpcDialOption)
 
 	collectionFilter := strings.TrimSpace(pluginworker.ReadStringConfig(request.GetAdminConfigValues(), "collection_filter", ""))
 	if collectionFilter != "" {
@@ -519,6 +524,10 @@ func (h *ErasureCodingHandler) Execute(
 		return err
 	}
 
+	// The cluster's EC ratio policy decides an unset ratio (ec.config). Load it
+	// from the filer in the cluster context before applying the defaults below.
+	syncECPolicyFromCluster(request.GetClusterContext(), h.grpcDialOption)
+
 	applyErasureCodingExecutionDefaults(params, request.GetClusterContext(), h.workingDir)
 
 	if len(params.Sources) == 0 || strings.TrimSpace(params.Sources[0].Node) == "" {
@@ -766,13 +775,15 @@ func decodeErasureCodingTaskParams(job *plugin_pb.JobSpec) (*worker_pb.TaskParam
 	}
 	collection := pluginworker.ReadStringConfig(job.Parameters, "collection", "")
 
-	dataShards := pluginworker.ReadInt32Config(job.Parameters, "data_shards", int32(ecstorage.DataShardsCount))
+	// fork: an explicit job parameter wins; otherwise the cluster's EC ratio
+	// policy decides (ec.config), and only then the build default.
+	dataShards := pluginworker.ReadInt32Config(job.Parameters, "data_shards", 0)
 	if dataShards <= 0 {
-		dataShards = int32(ecstorage.DataShardsCount)
+		dataShards = int32(policyDataShards(collection))
 	}
-	parityShards := pluginworker.ReadInt32Config(job.Parameters, "parity_shards", int32(ecstorage.ParityShardsCount))
+	parityShards := pluginworker.ReadInt32Config(job.Parameters, "parity_shards", 0)
 	if parityShards <= 0 {
-		parityShards = int32(ecstorage.ParityShardsCount)
+		parityShards = int32(policyParityShards(collection))
 	}
 	sourceDiskType := strings.TrimSpace(pluginworker.ReadStringConfig(job.Parameters, "source_disk_type", ""))
 	totalShards := int(dataShards + parityShards)
@@ -837,6 +848,9 @@ func applyErasureCodingExecutionDefaults(
 		return
 	}
 
+	// fork: the EC ratio policy is loaded by the detection and execution entry
+	// points (syncECPolicyFromCluster), which is where the cluster context is
+	// available; the resolvers below read it per collection.
 	ecParams := params.GetErasureCodingParams()
 	if ecParams == nil {
 		ecParams = &worker_pb.ErasureCodingTaskParams{
@@ -847,10 +861,10 @@ func applyErasureCodingExecutionDefaults(
 	}
 
 	if ecParams.DataShards <= 0 {
-		ecParams.DataShards = ecstorage.DataShardsCount
+		ecParams.DataShards = int32(policyDataShards(params.GetCollection()))
 	}
 	if ecParams.ParityShards <= 0 {
-		ecParams.ParityShards = ecstorage.ParityShardsCount
+		ecParams.ParityShards = int32(policyParityShards(params.GetCollection()))
 	}
 	ecParams.WorkingDir = defaultErasureCodingWorkingDir(baseWorkingDir)
 	ecParams.CleanupSource = true

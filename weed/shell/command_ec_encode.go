@@ -109,6 +109,18 @@ func (c *commandEcEncode) Do(args []string, commandEnv *CommandEnv, writer io.Wr
 	if err = commandEnv.confirmIsLocked(args); err != nil {
 		return
 	}
+
+	// fork: the cluster's EC ratio policy decides the layout new volumes are
+	// encoded with (see ec.config): load it once for the whole run. A cluster
+	// without a filer has no policy document and keeps the previous behavior (a
+	// volume's own .vif, else the build default). A read failure on a filer that
+	// IS configured is fatal on purpose: encoding at an unintended ratio is
+	// exactly what this policy exists to prevent.
+	if filerAddress := commandEnv.option.FilerAddress; filerAddress != "" {
+		if err = ec.LoadECConfigFromFiler(commandEnv.option.GrpcDialOption, filerAddress); err != nil {
+			return
+		}
+	}
 	rp, err := parseReplicaPlacementArg(commandEnv, *shardReplicaPlacement)
 	if err != nil {
 		return err

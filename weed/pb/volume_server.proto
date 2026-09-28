@@ -439,6 +439,11 @@ message VolumeTailReceiverResponse {
 message VolumeEcShardsGenerateRequest {
     uint32 volume_id = 1;
     string collection = 2;
+    // fork: the EC layout to encode with, resolved from the cluster's EC ratio
+    // policy (see weed/shell/command_ec_config.go). Unset keeps the previous
+    // behavior: the volume server uses an existing .vif's layout, else the build
+    // default. Field number matches the enterprise edition's ec_shard_config.
+    EcShardConfig ec_shard_config = 3;
 }
 message VolumeEcShardsGenerateResponse {
 }

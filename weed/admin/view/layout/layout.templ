@@ -29,7 +29,7 @@ templ Layout(view ViewContext, content templ.Component) {
   isMQPage := strings.HasPrefix(currentPath, "/mq/")
 
   // Detect if we're on a storage page to keep submenu expanded
-  isStoragePage := strings.HasPrefix(currentPath, "/storage/volumes") || strings.HasPrefix(currentPath, "/storage/ec-shards") || strings.HasPrefix(currentPath, "/storage/collections")
+  isStoragePage := strings.HasPrefix(currentPath, "/storage/volumes") || strings.HasPrefix(currentPath, "/storage/ec-shards") || strings.HasPrefix(currentPath, "/storage/ec-config") || strings.HasPrefix(currentPath, "/storage/collections")
 
   // Detect if we're on a cluster page (but not storage page) to keep submenu expanded
   isClusterPage := (strings.HasPrefix(currentPath, "/cluster/masters") || strings.HasPrefix(currentPath, "/cluster/volume-servers") || strings.HasPrefix(currentPath, "/cluster/filers") || strings.HasPrefix(currentPath, "/cluster/s3") || strings.HasPrefix(currentPath, "/cluster/mount-clients"))
@@ -163,6 +163,11 @@ templ Layout(view ViewContext, content templ.Component) {
                                     <li class="nav-item">
                                         <a class="nav-link py-2" href={ view.P("/storage/ec-shards") }>
                                             <i class="bi bi-grid me-2"></i>EC Volumes
+                                        </a>
+                                    </li>
+                                    <li class="nav-item">
+                                        <a class="nav-link py-2" href={ view.P("/storage/ec-config") }>
+                                            <i class="bi bi-shield-check me-2"></i>EC Configuration
                                         </a>
                                     </li>
                                     <li class="nav-item">

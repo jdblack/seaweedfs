@@ -85,7 +85,7 @@ func ProcessEcEncodeBatch(env *Env, writer io.Writer, volumeIds []needle.VolumeI
 		return fmt.Errorf("failed to collect volume locations before EC encoding: %w", err)
 	}
 
-	if err := checkEcEncodeCapacity(topologyInfo, len(volumeIds), diskType, collectionForMessage); err != nil {
+	if err := checkEcEncodeCapacity(topologyInfo, volumeIds, volumeIdToCollection, diskType, collectionForMessage); err != nil {
 		return err
 	}
 
@@ -182,15 +182,19 @@ func rollbackFailedEcEncode(env *Env, writer io.Writer, volumeIds []needle.Volum
 	}
 }
 
-func checkEcEncodeCapacity(topologyInfo *master_pb.TopologyInfo, volumeCount int, diskType types.DiskType, collectionForMessage string) error {
+func checkEcEncodeCapacity(topologyInfo *master_pb.TopologyInfo, volumeIds []needle.VolumeId, volumeIdToCollection map[needle.VolumeId]string, diskType types.DiskType, collectionForMessage string) error {
 	// Pre-flight check: verify the target disk type has capacity for EC shards.
 	// This prevents encoding shards only to fail during rebalance. Reuse the
 	// caller's topology snapshot instead of issuing another VolumeList to the
 	// master per batch.
 	_, totalFreeEcSlots := CollectEcVolumeServersByDc(topologyInfo, "", diskType)
 
-	// Each volume needs TotalShardsCount (14) shards distributed.
-	requiredSlots := volumeCount * erasure_coding.TotalShardsCount
+	// fork: each volume needs the shard count of the layout it will be encoded
+	// with — the cluster EC policy's for its collection, else the build default.
+	requiredSlots := 0
+	for _, vid := range volumeIds {
+		requiredSlots += ecLayoutTotalShards(volumeIdToCollection[vid])
+	}
 	if totalFreeEcSlots < 1 {
 		if diskType != types.HardDriveType {
 			tryDiskTypeMessage := "Try passing -diskType=hdd, or omit -diskType to use the default (hdd)"
@@ -205,7 +209,7 @@ func checkEcEncodeCapacity(topologyInfo *master_pb.TopologyInfo, volumeCount int
 
 	if totalFreeEcSlots < requiredSlots {
 		fmt.Printf("Warning: limited EC shard capacity. Need %d slots for %d volumes, but only %d slots available on disk type '%s'.\n",
-			requiredSlots, volumeCount, totalFreeEcSlots, diskType)
+			requiredSlots, len(volumeIds), totalFreeEcSlots, diskType)
 		fmt.Printf("Rebalancing may not achieve optimal distribution.\n")
 	}
 	return nil
@@ -383,15 +387,16 @@ func doEcEncode(env *Env, writer io.Writer, volumeIdToCollection map[needle.Volu
 		return nil, err
 	}
 
-	// mount all ec shards for the converted volume
-	shardIds := erasure_coding.AllShardIds()
-
+	// fork: mount the layout each volume actually generated. Not the build's 0..13
+	// shard list: a volume whose .vif records a custom ratio (e.g. 3+2)
+	// generates only that many shards, and the build's list then fails on the
+	// first id past it. mountGeneratedEcShards reads the layout off the holder.
 	ewg.Reset()
 	for _, vid := range volumeIds {
 		target := bestReplicas[vid]
 		collection := volumeIdToCollection[vid]
 		ewg.Add(func() error {
-			if err := MountEcShards(env.GrpcDialOption, collection, vid, target.ServerAddress(), shardIds); err != nil {
+			if err := mountGeneratedEcShards(env.GrpcDialOption, collection, vid, target.ServerAddress()); err != nil {
 				return fmt.Errorf("mount ec shards for volume %d on %s: %v", vid, target.Url, err)
 			}
 			return nil
@@ -918,11 +923,24 @@ func generateEcShards(grpcDialOption grpc.DialOption, volumeId needle.VolumeId, 
 
 	fmt.Printf("generateEcShards %d (collection %q) on %s ...\n", volumeId, collection, sourceVolumeServer)
 
+	request := &volume_server_pb.VolumeEcShardsGenerateRequest{
+		VolumeId:   uint32(volumeId),
+		Collection: collection,
+	}
+	// fork: ask for the cluster's policy layout when one covers this collection,
+	// so a volume with no recorded layout gets the operator's ratio instead of
+	// the build default. A volume server that predates this field ignores it and
+	// keeps using the .vif; the mount step then refuses to bring the volume
+	// online at a ratio the policy does not name.
+	if policy := erasure_coding.GetECConfig(collection); policy != nil {
+		request.EcShardConfig = &volume_server_pb.EcShardConfig{
+			DataShards:   uint32(policy.DataShards),
+			ParityShards: uint32(policy.ParityShards),
+		}
+	}
+
 	err := operation.WithVolumeServerClient(false, sourceVolumeServer, grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
-		_, genErr := volumeServerClient.VolumeEcShardsGenerate(context.Background(), &volume_server_pb.VolumeEcShardsGenerateRequest{
-			VolumeId:   uint32(volumeId),
-			Collection: collection,
-		})
+		_, genErr := volumeServerClient.VolumeEcShardsGenerate(context.Background(), request)
 		return genErr
 	})
 

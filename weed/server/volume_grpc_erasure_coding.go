@@ -63,23 +63,15 @@ func (vs *VolumeServer) VolumeEcShardsGenerate(ctx context.Context, req *volume_
 		return nil, fmt.Errorf("existing collection:%v unexpected input: %v", v.Collection, req.Collection)
 	}
 
-	// Create EC context - prefer existing .vif config if present (for regeneration scenarios)
-	ecCtx := erasure_coding.NewDefaultECContext(req.Collection, needle.VolumeId(req.VolumeId))
-	if volumeInfo, _, found, _ := volume_info.MaybeLoadVolumeInfo(baseFileName + ".vif"); found && volumeInfo.EcShardConfig != nil {
-		ds := int(volumeInfo.EcShardConfig.DataShards)
-		ps := int(volumeInfo.EcShardConfig.ParityShards)
-
-		// Validate and use existing EC config
-		if ds > 0 && ps > 0 && ds+ps <= erasure_coding.MaxShardCount {
-			ecCtx.DataShards = ds
-			ecCtx.ParityShards = ps
-			glog.V(0).Infof("Using existing EC config for volume %d: %s", req.VolumeId, ecCtx.String())
-		} else {
-			glog.Warningf("Invalid EC config in .vif for volume %d (data=%d, parity=%d), using defaults", req.VolumeId, ds, ps)
-		}
-	} else {
-		glog.V(0).Infof("Using default EC config for volume %d: %s", req.VolumeId, ecCtx.String())
+	// fork: resolve which EC layout to encode with — the caller's request first
+	// (the cluster's EC ratio policy, see ec.config), then an existing .vif, then
+	// the build default. The precedence itself lives in
+	// ec_generate_layout_fork.go so that it is unit-tested.
+	ecCtx, layoutSource, err := resolveGenerateEcLayout(needle.VolumeId(req.VolumeId), req.Collection, req.GetEcShardConfig(), baseFileName+".vif")
+	if err != nil {
+		return nil, err
 	}
+	glog.V(0).Infof("Using %s EC config for volume %d: %s", layoutSource, req.VolumeId, ecCtx.String())
 
 	shouldCleanup := true
 	defer func() {

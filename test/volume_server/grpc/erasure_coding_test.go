@@ -2,9 +2,12 @@ package volume_server_grpc_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +17,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/volume_info"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -867,5 +871,107 @@ func TestEcShardsCopyFailsWhenSourceUnavailable(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "VolumeEcShardsCopy volume") {
 		t.Fatalf("VolumeEcShardsCopy source-unavailable error mismatch: %v", err)
+	}
+}
+
+// A volume's EC layout now comes from the generate request — the cluster's EC
+// ratio policy. A .vif left over from an earlier encode must not steer the
+// result: that stale-ratio mismatch is the incident this field exists for (a
+// volume encoded 3+2 shards while the shell tried to mount a hardcoded 0..13
+// list, and the whole batch rolled back).
+func TestEcGenerateRequestedShardConfigOverridesStaleVif(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	clusterHarness := framework.StartVolumeCluster(t, matrix.P1())
+	conn, grpcClient := framework.DialVolumeServer(t, clusterHarness.VolumeGRPCAddress())
+	defer conn.Close()
+
+	const volumeID = uint32(130)
+	framework.AllocateVolume(t, grpcClient, volumeID, "")
+
+	httpClient := framework.NewHTTPClient()
+	fid := framework.NewFileID(volumeID, 990002, 0x55AA55AA)
+	uploadResp := framework.UploadBytes(t, httpClient, clusterHarness.VolumeAdminURL(), fid, []byte("ec-requested-layout-content"))
+	_ = framework.ReadAllAndClose(t, uploadResp)
+	if uploadResp.StatusCode != http.StatusCreated {
+		t.Fatalf("upload expected 201, got %d", uploadResp.StatusCode)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	shardPath := func(id uint32) string {
+		return filepath.Join(clusterHarness.BaseDir(), "volume", fmt.Sprintf("%d.ec%02d", volumeID, id))
+	}
+
+	// First encode with no requested layout: the build default, recorded in .vif.
+	if _, err := grpcClient.VolumeEcShardsGenerate(ctx, &volume_server_pb.VolumeEcShardsGenerateRequest{
+		VolumeId:   volumeID,
+		Collection: "",
+	}); err != nil {
+		t.Fatalf("default VolumeEcShardsGenerate failed: %v", err)
+	}
+	if _, err := os.Stat(shardPath(13)); err != nil {
+		t.Fatalf("expected the default encode to write 14 shards: %v", err)
+	}
+
+	// The premise: that run recorded its layout in the .vif, and the .vif survives
+	// (the volume has an .idx). Without this the second generate below would only
+	// be proving the default.
+	vifPath := filepath.Join(clusterHarness.BaseDir(), "volume", fmt.Sprintf("%d.vif", volumeID))
+	vifInfo, _, hasVif, vifErr := volume_info.MaybeLoadVolumeInfo(vifPath)
+	if vifErr != nil || !hasVif {
+		t.Fatalf("expected the first encode to leave %s readable (err=%v found=%v)", vifPath, vifErr, hasVif)
+	}
+	if recorded := vifInfo.GetEcShardConfig(); recorded == nil || recorded.GetDataShards() != erasure_coding.DataShardsCount {
+		t.Fatalf("expected the .vif to record the default %d+%d layout, got %v", erasure_coding.DataShardsCount, erasure_coding.ParityShardsCount, recorded)
+	}
+
+	// Now ask for 3+2, as ec.encode does when a policy covers the collection. The
+	// .vif from the line above is still there — it survives while the volume has
+	// an .idx — so this is the stale-ratio case.
+	if _, err := grpcClient.VolumeEcShardsGenerate(ctx, &volume_server_pb.VolumeEcShardsGenerateRequest{
+		VolumeId:   volumeID,
+		Collection: "",
+		EcShardConfig: &volume_server_pb.EcShardConfig{
+			DataShards:   3,
+			ParityShards: 2,
+		},
+	}); err != nil {
+		t.Fatalf("requested-layout VolumeEcShardsGenerate failed: %v", err)
+	}
+
+	for id := uint32(0); id < 5; id++ {
+		if _, err := os.Stat(shardPath(id)); err != nil {
+			t.Fatalf("expected shard %d of the requested 3+2 layout: %v", id, err)
+		}
+	}
+	for id := uint32(5); id < 14; id++ {
+		if _, err := os.Stat(shardPath(id)); err == nil {
+			t.Fatalf("shard %d exists: the requested 3+2 layout was not honored", id)
+		}
+	}
+
+	// The holder reports the layout it serves, which is what ec.encode checks the
+	// policy against before bringing a volume online.
+	if _, err := grpcClient.VolumeEcShardsMount(ctx, &volume_server_pb.VolumeEcShardsMountRequest{
+		VolumeId:   volumeID,
+		Collection: "",
+		ShardIds:   []uint32{0},
+	}); err != nil {
+		t.Fatalf("VolumeEcShardsMount failed: %v", err)
+	}
+	infoResp, err := grpcClient.VolumeEcShardsInfo(ctx, &volume_server_pb.VolumeEcShardsInfoRequest{VolumeId: volumeID})
+	if err != nil {
+		t.Fatalf("VolumeEcShardsInfo failed: %v", err)
+	}
+	cfg := infoResp.GetEcShardConfig()
+	if cfg == nil {
+		t.Fatalf("VolumeEcShardsInfo did not report a shard config")
+	}
+	if cfg.GetDataShards() != 3 || cfg.GetParityShards() != 2 {
+		t.Fatalf("VolumeEcShardsInfo reported %d+%d, want the requested 3+2", cfg.GetDataShards(), cfg.GetParityShards())
 	}
 }
