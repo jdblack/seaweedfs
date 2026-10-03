@@ -82,6 +82,28 @@ var (
 			Help:      "Counter of EC vacuum re-encode verification failures.",
 		})
 
+	// ECVacuumDecodeCandidatesDetectedCounter counts the EC volumes the decode route
+	// proposes in each cycle. Separate from jobs_detected_total, which goes on
+	// counting vacuum candidates alone.
+	ECVacuumDecodeCandidatesDetectedCounter = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: Namespace,
+			Subsystem: subsystemECVacuum,
+			Name:      "decode_candidates_detected_total",
+			Help:      "Counter of undersized EC volumes the decode route proposes.",
+		})
+
+	// ECVacuumJobsDecodedCounter counts EC volumes decoded back to regular volumes.
+	// Separate from jobs_executed_total because the two actions move data in
+	// opposite directions, and a threshold being ramped needs its own number.
+	ECVacuumJobsDecodedCounter = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: Namespace,
+			Subsystem: subsystemECVacuum,
+			Name:      "jobs_decoded_total",
+			Help:      "Counter of undersized EC volumes decoded back to regular volumes.",
+		})
+
 	// ECVacuumRolledBackCounter counts redistributions that failed and were rolled
 	// back to the collected originals.
 	ECVacuumRolledBackCounter = prometheus.NewCounter(
@@ -111,6 +133,8 @@ func init() {
 	Gather.MustRegister(ECVacuumBytesReclaimedCounter)
 	Gather.MustRegister(ECVacuumShardRebuildHistogram)
 	Gather.MustRegister(ECVacuumVerifyFailuresCounter)
+	Gather.MustRegister(ECVacuumJobsDecodedCounter)
+	Gather.MustRegister(ECVacuumDecodeCandidatesDetectedCounter)
 	Gather.MustRegister(ECVacuumRolledBackCounter)
 	Gather.MustRegister(ECVacuumLastSuccessTimestamp)
 }

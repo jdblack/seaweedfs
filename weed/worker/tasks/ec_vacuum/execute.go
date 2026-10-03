@@ -7,16 +7,19 @@ import (
 
 	"github.com/seaweedfs/seaweedfs/weed/ec/ecvacuum"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/plugin_pb"
 	pluginworker "github.com/seaweedfs/seaweedfs/weed/plugin/worker"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
 )
 
-// Execute collects one EC volume's shards onto the worker, compacts them locally,
-// and distributes the compacted shards back. The heavy decode/compact/re-encode
-// work happens entirely in the worker's working directory; the volume servers
-// only serve shard transfers. The vacuum itself is the shared
-// ecvacuum.VacuumVolume, so this worker and the `ec.vacuum` shell command behave
-// identically.
+// Execute runs one EC volume job in the mode the proposal carried.
+//
+// A vacuum collects the volume's shards onto the worker, compacts them locally and
+// distributes them back (the shared ecvacuum.VacuumVolume, so this worker and
+// `ec.vacuum` behave identically). A decode regenerates a regular volume from the
+// shards and drops them, entirely on a volume server, so it needs no worker scratch
+// space. See decodeEcVolume for what the decode deliberately does not check.
 func (h *VacuumHandler) Execute(ctx context.Context, request *plugin_pb.ExecuteJobRequest, sender pluginworker.ExecutionSender) error {
 	if request == nil || request.GetJob() == nil {
 		return fmt.Errorf("execute request/job is nil")
@@ -29,20 +32,28 @@ func (h *VacuumHandler) Execute(ctx context.Context, request *plugin_pb.ExecuteJ
 		return fmt.Errorf("job type %q is not handled by %s worker", jt, jobType)
 	}
 
-	volumeID, collection, diskType, err := decodeJobParams(job)
+	mode, volumeID, collection, diskType, err := parseJobParams(job)
 	if err != nil {
 		return err
 	}
 	cfg := deriveConfig(request.GetAdminConfigValues(), request.GetWorkerConfigValues())
 
-	if err := sendProgress(sender, job, plugin_pb.JobState_JOB_STATE_ASSIGNED, 0, "assigned", "EC vacuum job accepted"); err != nil {
+	accepted := "EC volume maintenance job accepted"
+	if mode == modeDecode {
+		accepted = "EC volume decode job accepted"
+	}
+	if err := sendProgress(sender, job, plugin_pb.JobState_JOB_STATE_ASSIGNED, 0, "assigned", accepted); err != nil {
 		return err
 	}
 
 	masters := masterAddresses(request.GetClusterContext())
-	topo, err := h.fetchTopology(ctx, masters)
+	topo, _, err := h.fetchTopology(ctx, masters)
 	if err != nil {
 		return failJob(sender, job, fmt.Errorf("fetch topology: %w", err))
+	}
+
+	if mode == modeDecode {
+		return h.executeDecode(ctx, sender, job, masters, topo, volumeID, collection, diskType)
 	}
 
 	target, err := buildVacuumTarget(topo, volumeID, collection, diskType)
@@ -69,8 +80,27 @@ func (h *VacuumHandler) Execute(ctx context.Context, request *plugin_pb.ExecuteJ
 
 	summary := fmt.Sprintf("Vacuumed EC volume %d: %d -> %d shard bytes (reclaimed %d)",
 		volumeID, out.OldShardBytes, out.NewShardBytes, out.Reclaimed)
-	glog.V(1).Infof("ec_vacuum: %s", summary)
+	glog.Infof("ec_vacuum: %s", summary)
 	return emitCompleted(sender, job, true, summary, "", vacuumOutputs(volumeID, out.Reclaimed, out.NewShardBytes),
+		[]*plugin_pb.ActivityEvent{pluginworker.BuildExecutorActivity("completed", summary)})
+}
+
+// executeDecode decodes one undersized EC volume back to a regular volume. There is
+// no worker-local work to report on, so the progress figures are coarse: the
+// decode's own trace goes to stdout rather than being parsed for stage boundaries.
+func (h *VacuumHandler) executeDecode(ctx context.Context, sender pluginworker.ExecutionSender, job *plugin_pb.JobSpec, masters []string, topo *master_pb.TopologyInfo, volumeID uint32, collection, diskType string) error {
+	if err := sendProgress(sender, job, plugin_pb.JobState_JOB_STATE_RUNNING, 10, "decoding",
+		fmt.Sprintf("decoding EC volume %d back to a regular volume", volumeID)); err != nil {
+		return err
+	}
+	if err := h.decodeVolume(ctx, masters, topo, volumeID, collection, diskType); err != nil {
+		return failJob(sender, job, fmt.Errorf("decode EC volume %d: %w", volumeID, err))
+	}
+	stats.ECVacuumJobsDecodedCounter.Inc()
+
+	summary := fmt.Sprintf("Decoded undersized EC volume %d back to a regular volume", volumeID)
+	glog.Infof("ec_vacuum: %s", summary)
+	return emitCompleted(sender, job, true, summary, "", decodeOutputs(volumeID),
 		[]*plugin_pb.ActivityEvent{pluginworker.BuildExecutorActivity("completed", summary)})
 }
 

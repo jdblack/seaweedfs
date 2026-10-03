@@ -37,9 +37,9 @@ func (s *fakeDetectionSender) SendActivity(*plugin_pb.ActivityEvent) error {
 func TestDetectSkipsWhenRecent(t *testing.T) {
 	handler := NewEcVacuumHandler(nil, t.TempDir())
 	fetches := 0
-	handler.fetchTopology = func(context.Context, []string) (*master_pb.TopologyInfo, error) {
+	handler.fetchTopology = func(context.Context, []string) (*master_pb.TopologyInfo, uint64, error) {
 		fetches++
-		return syntheticTopo("c1", 1, 0x3FFF, 10), nil
+		return syntheticTopo("c1", 1, 0x3FFF, 10), 0, nil
 	}
 
 	sender := &fakeDetectionSender{}
@@ -81,8 +81,8 @@ func TestDetectFiltersByDiskType(t *testing.T) {
 	}
 
 	handler := NewEcVacuumHandler(nil, t.TempDir())
-	handler.fetchTopology = func(context.Context, []string) (*master_pb.TopologyInfo, error) {
-		return topo, nil
+	handler.fetchTopology = func(context.Context, []string) (*master_pb.TopologyInfo, uint64, error) {
+		return topo, 0, nil
 	}
 
 	sender := &fakeDetectionSender{}
@@ -104,8 +104,8 @@ func TestExecuteNoLiveNeedlesIsSuccessfulNoOp(t *testing.T) {
 	buildEncodedFixture(t, srcDir, "c1", 1, 5, 5) // every needle deleted
 
 	handler := NewEcVacuumHandler(nil, t.TempDir())
-	handler.fetchTopology = func(context.Context, []string) (*master_pb.TopologyInfo, error) {
-		return syntheticTopo("c1", 1, 0x3FFF, 5), nil
+	handler.fetchTopology = func(context.Context, []string) (*master_pb.TopologyInfo, uint64, error) {
+		return syntheticTopo("c1", 1, 0x3FFF, 5), 0, nil
 	}
 	fake := &fakeTransport{srcDir: srcDir}
 	handler.transport = fake
@@ -139,10 +139,14 @@ func TestLoadVacuumOptionsWithoutVif(t *testing.T) {
 	require.Zero(t, opts.EncodedDatFileSize)
 }
 
-// TestJobPriority verifies the heavily-deleted volume is bumped to HIGH.
+// TestJobPriority verifies the heavily-deleted volume is bumped to HIGH, and that
+// a decode is bumped only when the volume has no live data left at all.
 func TestJobPriority(t *testing.T) {
-	require.Equal(t, plugin_pb.JobPriority_JOB_PRIORITY_HIGH, jobPriority(0.7))
-	require.Equal(t, plugin_pb.JobPriority_JOB_PRIORITY_NORMAL, jobPriority(0.3))
+	require.Equal(t, plugin_pb.JobPriority_JOB_PRIORITY_HIGH, jobPriority(garbageCandidate{FileCount: 10, DeleteCount: 7}, modeVacuum))
+	require.Equal(t, plugin_pb.JobPriority_JOB_PRIORITY_NORMAL, jobPriority(garbageCandidate{FileCount: 10, DeleteCount: 3}, modeVacuum))
+
+	require.Equal(t, plugin_pb.JobPriority_JOB_PRIORITY_NORMAL, jobPriority(garbageCandidate{LiveBytes: 1024}, modeDecode))
+	require.Equal(t, plugin_pb.JobPriority_JOB_PRIORITY_HIGH, jobPriority(garbageCandidate{FileCount: 10, DeleteCount: 10}, modeDecode))
 }
 
 // TestDeletedRatioZeroFileCount verifies the divide-by-zero guard.

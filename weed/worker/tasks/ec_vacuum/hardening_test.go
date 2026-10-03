@@ -60,8 +60,8 @@ func TestExecuteRollsBackOnRedistributeFailure(t *testing.T) {
 	buildEncodedFixture(t, srcDir, "c1", 1, 20, 10)
 
 	handler := NewEcVacuumHandler(nil, t.TempDir())
-	handler.fetchTopology = func(context.Context, []string) (*master_pb.TopologyInfo, error) {
-		return syntheticTopo("c1", 1, 0x3FFF, 10), nil
+	handler.fetchTopology = func(context.Context, []string) (*master_pb.TopologyInfo, uint64, error) {
+		return syntheticTopo("c1", 1, 0x3FFF, 10), 0, nil
 	}
 	fake := &fakeTransport{srcDir: srcDir, failRedistributes: 1}
 	handler.transport = fake

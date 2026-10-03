@@ -126,8 +126,8 @@ func TestExecuteVacuumEndToEnd(t *testing.T) {
 	buildEncodedFixture(t, srcDir, collection, vid, 20, 10)
 
 	handler := NewEcVacuumHandler(nil, t.TempDir())
-	handler.fetchTopology = func(context.Context, []string) (*master_pb.TopologyInfo, error) {
-		return syntheticTopo(collection, vid, 0x3FFF, 10), nil
+	handler.fetchTopology = func(context.Context, []string) (*master_pb.TopologyInfo, uint64, error) {
+		return syntheticTopo(collection, vid, 0x3FFF, 10), 0, nil
 	}
 	fake := &fakeTransport{srcDir: srcDir}
 	handler.transport = fake
@@ -153,8 +153,8 @@ func TestExecuteVacuumEndToEnd(t *testing.T) {
 // failed rather than vacuud, so ec.rebuild can repair it first.
 func TestExecuteRefusesUndecodableVolume(t *testing.T) {
 	handler := NewEcVacuumHandler(nil, t.TempDir())
-	handler.fetchTopology = func(context.Context, []string) (*master_pb.TopologyInfo, error) {
-		return syntheticTopo("c1", 1, 0x3FFE, 10), nil // data shard 0 missing
+	handler.fetchTopology = func(context.Context, []string) (*master_pb.TopologyInfo, uint64, error) {
+		return syntheticTopo("c1", 1, 0x3FFE, 10), 0, nil // data shard 0 missing
 	}
 	handler.transport = &fakeTransport{srcDir: t.TempDir()}
 

@@ -19,8 +19,11 @@ func BuildVacuumTarget(topo *master_pb.TopologyInfo, volumeID uint32, collection
 	if gens := encodeGenerations(topo, volumeID, collection, diskType); len(gens) > 1 {
 		return VacuumTarget{}, fmt.Errorf("EC volume %d spans %d encode generations; a prior operation may be incomplete, run ec.rebuild before vacuuming", volumeID, len(gens))
 	}
+	if dup := duplicateShardIDs(topo, volumeID, collection, diskType); len(dup) > 0 {
+		return VacuumTarget{}, fmt.Errorf("EC volume %d has more than one copy of shard(s) %v; a balance may be incomplete, run ec.balance before vacuuming", volumeID, dup)
+	}
 
-	holders := shardHolders(topo, volumeID, collection, diskType)
+	holders, diskIDs := shardHolders(topo, volumeID, collection, diskType)
 	if len(holders) == 0 {
 		return VacuumTarget{}, fmt.Errorf("no shards found for EC volume %d collection %q", volumeID, collection)
 	}
@@ -41,13 +44,16 @@ func BuildVacuumTarget(topo *master_pb.TopologyInfo, volumeID uint32, collection
 		DiskType:     diskType,
 		DataShards:   dataShards,
 		ParityShards: parityShards,
-		EncodeTsNs:   newestEncodeTsNs(topo, volumeID, collection, diskType),
 		Holders:      holders,
+		DiskIDs:      diskIDs,
 	}, nil
 }
 
 // LoadVacuumOptions fills the vacuum inputs from the collected .vif, falling back
-// to the topology's ratio and the legacy block layout when the .vif is absent.
+// to the topology's ratio and the legacy block layout when the .vif is absent. A
+// .vif that *records* a layout is authoritative and is validated: an impossible
+// ratio or an unaligned block size is refused rather than guessed around, because
+// either one decodes the shards at the wrong offsets.
 func LoadVacuumOptions(workDir, base string, target VacuumTarget) (Options, error) {
 	opts := Options{
 		VolumeID:     target.VolumeID,
@@ -69,9 +75,27 @@ func LoadVacuumOptions(workDir, base string, target VacuumTarget) (Options, erro
 	opts.ExpireAtSec = vi.GetExpireAtSec()
 	opts.EncodedDatFileSize = vi.GetDatFileSize()
 	if cfg := vi.GetEcShardConfig(); cfg != nil {
-		if erasure_coding.ValidEcShardCounts(cfg.GetDataShards(), cfg.GetParityShards()) {
-			opts.DataShards = int(cfg.GetDataShards())
-			opts.ParityShards = int(cfg.GetParityShards())
+		dataShards, parityShards := cfg.GetDataShards(), cfg.GetParityShards()
+		switch {
+		case dataShards == 0 && parityShards == 0:
+			// Nothing recorded: keep the ratio the topology reported.
+		case erasure_coding.ValidEcShardCounts(dataShards, parityShards):
+			opts.DataShards = int(dataShards)
+			opts.ParityShards = int(parityShards)
+		default:
+			// A recorded-but-impossible ratio is corruption, not a reason to
+			// substitute another one: the shards were laid out by the recorded
+			// matrix, so reading them back through a different one returns wrong
+			// bytes. Refuse, as RebuildEcFiles does.
+			return opts, fmt.Errorf("volume %d .vif records invalid shard counts %d+%d", target.VolumeID, dataShards, parityShards)
+		}
+		// A block size the encoder could not have produced maps every read to the
+		// wrong shard offset, and the damage is self-consistent — VerifyEncodedShards
+		// decodes the re-encoded shards back through this same layout — so it would
+		// pass verification and be published to the holders. Refuse it, as the mount
+		// and rebuild paths do.
+		if err := erasure_coding.ValidateBlockSize(cfg.GetBlockSize()); err != nil {
+			return opts, fmt.Errorf("volume %d .vif: %w", target.VolumeID, err)
 		}
 		opts.BlockSize = cfg.GetBlockSize()
 	}

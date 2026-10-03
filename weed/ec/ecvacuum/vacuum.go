@@ -40,7 +40,6 @@ type Options struct {
 type Result struct {
 	OldShardBytes int64
 	NewShardBytes int64
-	LiveNeedles   uint64
 }
 
 // HasAllDataShards reports whether every data shard id (0..dataShards-1) is
@@ -156,14 +155,15 @@ func VacuumLocalDir(dir, base string, opts Options) (Result, error) {
 	}
 
 	// Re-encode the compacted .dat into a fresh, deletes-free shard set. This
-	// writes .ec00.. and leaves the layout it used on ctx.
-	ctx := &erasure_coding.ECContext{
+	// writes .ec00.. and leaves the layout it used on ecCtx. (Not named ctx: this
+	// function takes no context, and the name would read as if it did.)
+	ecCtx := &erasure_coding.ECContext{
 		DataShards:   opts.DataShards,
 		ParityShards: opts.ParityShards,
 		Collection:   opts.Collection,
 		VolumeId:     needle.VolumeId(opts.VolumeID),
 	}
-	ecBitrot, err := erasure_coding.WriteEcFiles(fullBase, ctx)
+	ecBitrot, err := erasure_coding.WriteEcFiles(fullBase, ecCtx)
 	if err != nil {
 		return res, fmt.Errorf("re-encode shards: %w", err)
 	}
@@ -182,12 +182,12 @@ func VacuumLocalDir(dir, base string, opts Options) (Result, error) {
 	vi := &volume_server_pb.VolumeInfo{
 		Version:     opts.Version,
 		ExpireAtSec: opts.ExpireAtSec,
-		DatFileSize: ctx.DatFileSize,
+		DatFileSize: ecCtx.DatFileSize,
 		EcShardConfig: &volume_server_pb.EcShardConfig{
 			DataShards:   uint32(opts.DataShards),
 			ParityShards: uint32(opts.ParityShards),
 			EncodeTsNs:   time.Now().UnixNano(),
-			BlockSize:    ctx.BlockSize,
+			BlockSize:    ecCtx.BlockSize,
 		},
 	}
 	if err := volume_info.SaveVolumeInfo(fullBase+".vif", vi); err != nil {

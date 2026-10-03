@@ -30,8 +30,8 @@ func TestMetricsOnSuccessfulVacuum(t *testing.T) {
 	buildEncodedFixture(t, srcDir, "c1", 1, 20, 10)
 
 	handler := NewEcVacuumHandler(nil, t.TempDir())
-	handler.fetchTopology = func(context.Context, []string) (*master_pb.TopologyInfo, error) {
-		return syntheticTopo("c1", 1, 0x3FFF, 10), nil
+	handler.fetchTopology = func(context.Context, []string) (*master_pb.TopologyInfo, uint64, error) {
+		return syntheticTopo("c1", 1, 0x3FFF, 10), 0, nil
 	}
 	handler.transport = &fakeTransport{srcDir: srcDir}
 
@@ -51,8 +51,8 @@ func TestMetricsOnFailedVacuum(t *testing.T) {
 	buildEncodedFixture(t, srcDir, "c1", 1, 20, 10)
 
 	handler := NewEcVacuumHandler(nil, t.TempDir())
-	handler.fetchTopology = func(context.Context, []string) (*master_pb.TopologyInfo, error) {
-		return syntheticTopo("c1", 1, 0x3FFF, 10), nil
+	handler.fetchTopology = func(context.Context, []string) (*master_pb.TopologyInfo, uint64, error) {
+		return syntheticTopo("c1", 1, 0x3FFF, 10), 0, nil
 	}
 	handler.transport = &fakeTransport{srcDir: srcDir, failRedistributes: 1}
 
@@ -71,8 +71,8 @@ func TestMetricsOnNoLiveEntries(t *testing.T) {
 	buildEncodedFixture(t, srcDir, "c1", 1, 5, 5)
 
 	handler := NewEcVacuumHandler(nil, t.TempDir())
-	handler.fetchTopology = func(context.Context, []string) (*master_pb.TopologyInfo, error) {
-		return syntheticTopo("c1", 1, 0x3FFF, 5), nil
+	handler.fetchTopology = func(context.Context, []string) (*master_pb.TopologyInfo, uint64, error) {
+		return syntheticTopo("c1", 1, 0x3FFF, 5), 0, nil
 	}
 	handler.transport = &fakeTransport{srcDir: srcDir}
 

@@ -38,11 +38,17 @@ const (
 	// redistribute cycle.
 	defaultScanTimeoutSeconds = 3600
 
-	fieldCollectionFilter = "collection_filter"
-	fieldDiskType         = "disk_type"
-	fieldGarbageThreshold = "garbage_threshold"
-	fieldMinIntervalMins  = "min_interval_minutes"
-	fieldScanTimeoutSecs  = "scan_timeout_seconds"
+	// defaultDecodeBelowFullnessPercent is half-full. The encode job only erases
+	// volumes at FullnessRatio (0.95), so a volume must lose about half its needles
+	// to reach it; a cluster holding undersized volumes should ramp up from 0.
+	defaultDecodeBelowFullnessPercent = 0.50
+
+	fieldCollectionFilter    = "collection_filter"
+	fieldDiskType            = "disk_type"
+	fieldGarbageThreshold    = "garbage_threshold"
+	fieldDecodeBelowFullness = "decode_below_fullness_percent"
+	fieldMinIntervalMins     = "min_interval_minutes"
+	fieldScanTimeoutSecs     = "scan_timeout_seconds"
 )
 
 // Config is the resolved configuration for one ec_vacuum detection or execution
@@ -55,20 +61,29 @@ type Config struct {
 	// GarbageThreshold is the deleted-needle ratio (deleteCount / fileCount) a
 	// volume must reach to be proposed for vacuum.
 	GarbageThreshold float64
+	// DecodeBelowFullnessPercent is the live-data fullness (liveBytes / volume size
+	// limit) at or below which a volume is decoded instead of vacuumed. 0 disables
+	// the decode route. It must stay below the encode job's fullness_ratio (0.95),
+	// or a volume is decoded only to be re-encoded.
+	DecodeBelowFullnessPercent float64
 	// MinIntervalMinutes skips detection when the last successful run is more
 	// recent than this many minutes.
 	MinIntervalMinutes int
-	// ScanTimeoutSeconds bounds a single volume's vacuum cycle.
+	// ScanTimeoutSeconds bounds a volume's collect and redistribute stages. The
+	// local compaction between them is not interruptible (see RunOptions.Timeout),
+	// so a volume can overrun this.
 	ScanTimeoutSeconds int
 }
 
-// NewDefaultConfig returns the defaults: a 30% delete-ratio threshold, a
-// 30-minute detection cadence, and a one-hour per-volume timeout.
+// NewDefaultConfig returns the defaults: a 30% delete-ratio threshold, a 50%
+// decode-below-fullness threshold, a 30-minute detection cadence, and a one-hour
+// per-volume timeout.
 func NewDefaultConfig() *Config {
 	return &Config{
-		GarbageThreshold:   defaultGarbageThreshold,
-		MinIntervalMinutes: defaultMinIntervalMinutes,
-		ScanTimeoutSeconds: defaultScanTimeoutSeconds,
+		GarbageThreshold:           defaultGarbageThreshold,
+		DecodeBelowFullnessPercent: defaultDecodeBelowFullnessPercent,
+		MinIntervalMinutes:         defaultMinIntervalMinutes,
+		ScanTimeoutSeconds:         defaultScanTimeoutSeconds,
 	}
 }
 
@@ -82,8 +97,23 @@ func deriveConfig(adminValues, workerValues map[string]*plugin_pb.ConfigValue) *
 
 	if v := pluginworker.ReadDoubleConfig(adminValues, fieldGarbageThreshold, cfg.GarbageThreshold); v > 0 && v <= 1 {
 		cfg.GarbageThreshold = v
+	} else if v == 0 {
+		// The descriptor advertises a 0 minimum and the shell's -garbageThreshold
+		// reads 0 as "every volume", so an operator can legitimately arrive here
+		// with 0. Say out loud that it is ignored rather than silently keeping the
+		// default: "every volume" is not expressible here, because a volume with
+		// no live needles is never vacuumed (only a decode can reclaim it).
+		glog.Warningf("ec_vacuum: garbage_threshold 0 is not supported; using %v (a volume needs live needles and more than this fraction deleted to be vacuumed)", cfg.GarbageThreshold)
+	} else {
+		glog.Warningf("ec_vacuum: ignoring out-of-range garbage_threshold %v; using %v", v, cfg.GarbageThreshold)
+	}
+
+	// 0 is meaningful here (disable), so the range starts at 0. 1.0 is excluded: a
+	// volume that is 100% full is not undersized.
+	if v := pluginworker.ReadDoubleConfig(adminValues, fieldDecodeBelowFullness, cfg.DecodeBelowFullnessPercent); v >= 0 && v < 1 {
+		cfg.DecodeBelowFullnessPercent = v
 	} else if v != 0 {
-		glog.V(1).Infof("ec_vacuum: ignoring out-of-range garbage_threshold %v; using %v", v, cfg.GarbageThreshold)
+		glog.Warningf("ec_vacuum: ignoring out-of-range decode_below_fullness_percent %v; using %v", v, cfg.DecodeBelowFullnessPercent)
 	}
 
 	if v := pluginworker.ReadIntConfig(workerValues, fieldMinIntervalMins, cfg.MinIntervalMinutes); v > 0 {

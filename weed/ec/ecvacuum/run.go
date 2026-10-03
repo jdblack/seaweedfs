@@ -27,8 +27,10 @@ type RunOptions struct {
 	// it and removed when the vacuum finishes (success or failure). Empty uses
 	// os.TempDir().
 	WorkingDir string
-	// Timeout bounds the whole collect -> compact -> redistribute cycle. Zero
-	// means no extra bound beyond the caller's context.
+	// Timeout bounds the collect and redistribute stages. It cannot interrupt the
+	// local decode/compact/re-encode between them: that runs inside
+	// storage.CompactVolumeFiles and the encoder, neither of which takes a
+	// context, so the CPU-bound stage runs to completion even past this deadline.
 	Timeout time.Duration
 	// OnStage, when set, is called as the vacuum moves between stages. Returning
 	// an error aborts the vacuum (e.g. a progress sender that lost its worker).
@@ -49,6 +51,20 @@ type Outcome struct {
 	OldShardBytes int64
 	NewShardBytes int64
 	Reclaimed     int64
+}
+
+// defaultRollbackLimit bounds the rollback when RunOptions.Timeout is 0. The
+// rollback re-pushes one volume's shards, so a per-volume timeout is a sane
+// bound for it too.
+const defaultRollbackLimit = 10 * time.Minute
+
+// rollbackLimit is the bound the rollback gets: the caller's per-volume timeout
+// when it set one, else defaultRollbackLimit.
+func rollbackLimit(timeout time.Duration) time.Duration {
+	if timeout > 0 {
+		return timeout
+	}
+	return defaultRollbackLimit
 }
 
 // VacuumVolume runs one EC volume vacuum against a live cluster: it collects the
@@ -126,10 +142,20 @@ func VacuumVolume(ctx context.Context, transport ShardTransport, target VacuumTa
 	if err := transport.Redistribute(execCtx, target, scratchDir, base, true); err != nil {
 		// The compacted set is verified, but the push failed partway, leaving some
 		// holders on the new generation and others on the old. Restore the
-		// collected originals so the volume is not left mixed-generation. The
-		// rollback keeps the holders' journals: the original generation's .ecx
-		// still contains those needles, so its deletes are real.
-		if rbErr := transport.Redistribute(execCtx, target, origDir, base, false); rbErr != nil {
+		// collected originals so the volume is not left mixed-generation.
+		//
+		// The rollback must not run on execCtx. A push most often fails *because*
+		// that context expired or was canceled (the per-volume timeout, the admin
+		// canceling the job, the worker shutting down), and a dead context fails
+		// every rollback RPC instantly — leaving exactly the mixed state the
+		// rollback exists to prevent. Detach from the caller's cancellation and
+		// bound the recovery on its own.
+		//
+		// Redistribute(clearJournal=false) touches no delete journal, so the
+		// holders' own journals still describe the generation being restored.
+		rollbackCtx, cancelRollback := context.WithTimeout(context.WithoutCancel(ctx), rollbackLimit(opts.Timeout))
+		defer cancelRollback()
+		if rbErr := transport.Redistribute(rollbackCtx, target, origDir, base, false); rbErr != nil {
 			glog.Errorf("ec_vacuum: volume %d: redistribute failed (%v) and rollback failed (%v); run ec.rebuild", target.VolumeID, err, rbErr)
 			return out, fmt.Errorf("redistribute shards for volume %d: %w (rollback also failed: %v; run ec.rebuild)", target.VolumeID, err, rbErr)
 		}

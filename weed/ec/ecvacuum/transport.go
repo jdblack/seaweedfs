@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
@@ -25,8 +26,24 @@ type VacuumTarget struct {
 	DiskType     string
 	DataShards   int
 	ParityShards int
-	EncodeTsNs   int64
 	Holders      map[uint32]string
+	// DiskIDs is the disk each shard id sits on, as the volume server counts its
+	// own -dir list (the topology's per-shard disk_id). Redistribute passes it to
+	// ReceiveFile so a compacted shard overwrites its predecessor on the disk it
+	// came from. With disk_id unset the server auto-selects a disk, which on a
+	// multi-disk node can move the shard to a sibling and leave the old shard
+	// file behind as an orphan copy — the very state that makes a volume
+	// un-vacuumable (see duplicateShardIDs). An absent or zero entry keeps the
+	// auto-selection, so a caller that does not know the disk still works.
+	DiskIDs map[uint32]uint32
+}
+
+// holderDisk identifies one volume server disk. A shard belongs to exactly one
+// disk of one node, so a node holding two disks' worth of a volume is two
+// groups, each of which ReceiveFile must be told about explicitly.
+type holderDisk struct {
+	address string
+	diskID  uint32
 }
 
 // sortedShardIDs returns the target's shard ids in ascending order for
@@ -49,10 +66,16 @@ type ShardTransport interface {
 	// actually placed on disk.
 	Collect(ctx context.Context, target VacuumTarget, dir, base string) ([]uint32, error)
 	// Redistribute unmounts each holder's old shards, pushes the compacted shards
-	// and sidecars, and mounts them so the holders serve the new generation. When
-	// clearJournal is set, each holder's .ecj delete journal is overwritten with an
-	// empty one (the vacuum has spent those deletes); the rollback path passes
-	// false to keep the holders' journals, which still describe a real generation.
+	// and sidecars, and mounts them so the holders serve the new generation. An
+	// error means the volume is on mixed generations and the caller should push
+	// dir's counterpart (the collected originals) back.
+	//
+	// When clearJournal is set, each holder's .ecj delete journal is overwritten
+	// with an empty one (the vacuum has spent those deletes), but only after every
+	// holder serves the new generation, and best-effort: see the implementation
+	// for why the order makes the rollback exact and why a failure there must not
+	// fail the vacuum. The rollback path passes false to keep the holders'
+	// journals, which still describe a real generation.
 	Redistribute(ctx context.Context, target VacuumTarget, dir, base string, clearJournal bool) error
 }
 
@@ -227,67 +250,142 @@ func (c *ClusterTransport) copyEcFileFromHolder(ctx context.Context, holder stri
 	return nil
 }
 
-// Redistribute replaces the holders' shards with the compacted set: it unmounts
-// each holder's shards, pushes the compacted shards and sidecars, then mounts
-// them. The shard ids are unchanged (the ratio is preserved), so each compacted
-// shard overwrites its predecessor in place. A reader that hits a momentarily
-// unmounted shard falls back to Reed-Solomon reconstruction.
-//
-// When clearJournal is set, the re-encoded shards no longer contain the deleted
-// needles, so each holder's .ecj delete journal is overwritten with an empty one.
-// Leaving the spent deletes behind would keep the volume reporting a non-zero
-// delete count for needles that are gone (misleading vacuum detection and anyone
-// inspecting the volume). The overwrite happens while the shards are unmounted,
-// which ReceiveFile requires.
-func (c *ClusterTransport) Redistribute(ctx context.Context, target VacuumTarget, dir, base string, clearJournal bool) error {
-	byHolder := make(map[string][]uint32)
-	var holders []string
-	for _, id := range target.sortedShardIDs() {
-		h := target.Holders[id]
-		if _, ok := byHolder[h]; !ok {
-			holders = append(holders, h)
+// shardsByHolder groups the target's shard ids by the (holder, disk) that owns
+// them, ascending inside each group and with the groups themselves sorted, so
+// collection and redistribution are deterministic.
+func (t VacuumTarget) shardsByHolder() (map[holderDisk][]uint32, []holderDisk) {
+	byDisk := make(map[holderDisk][]uint32)
+	var keys []holderDisk
+	for _, id := range t.sortedShardIDs() {
+		key := holderDisk{address: t.Holders[id], diskID: t.DiskIDs[id]}
+		if _, ok := byDisk[key]; !ok {
+			keys = append(keys, key)
 		}
-		byHolder[h] = append(byHolder[h], id)
+		byDisk[key] = append(byDisk[key], id)
 	}
-	sort.Strings(holders)
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].address != keys[j].address {
+			return keys[i].address < keys[j].address
+		}
+		return keys[i].diskID < keys[j].diskID
+	})
+	return byDisk, keys
+}
+
+// Redistribute replaces the holders' shards with the compacted set. It runs in
+// two phases, and the split is what makes VacuumVolume's rollback exact:
+//
+//  1. Every (holder, disk) is switched to the new generation: unmount its old
+//     shards, push the compacted shards and sidecars, mount them. An error here
+//     leaves the volume on mixed generations, while the caller's collected
+//     originals are still a complete copy of the previous one.
+//  2. Only once every holder serves the new generation are the spent delete
+//     journals cleared, best-effort.
+//
+// The order matters because clearing a journal cannot be undone. Each journal —
+// one per disk a holder keeps shards on — holds a disjoint subset of the volume's
+// deletes, and the caller keeps the originals' *merged* journal rather than those
+// subsets, so a rollback could never restore what a partially-cleared set gave up:
+// those deletes would revert silently while the original .ecx (which does not carry
+// them) served the needles again. Clearing last means a failed push has touched no
+// journal at all.
+//
+// Clearing is best-effort because it is cosmetic: the new .ecx was rebuilt from
+// the compacted index, so it no longer names the deleted needles, and a leftover
+// journal entry for an unknown id is simply ignored (RebuildEcxFile treats it as
+// NotFound). A holder that keeps its journal serves exactly the same live set,
+// only with a stale delete count — so a failure here must not fail a vacuum whose
+// data is already correct and verified.
+//
+// The shard ids are unchanged (the ratio is preserved), so each compacted shard
+// overwrites its predecessor in place. A reader that hits a momentarily
+// unmounted shard falls back to Reed-Solomon reconstruction.
+func (c *ClusterTransport) Redistribute(ctx context.Context, target VacuumTarget, dir, base string, clearJournal bool) error {
+	byDisk, disks := target.shardsByHolder()
+
+	for _, key := range disks {
+		if err := c.replaceShards(ctx, key, target, dir, base, byDisk[key]); err != nil {
+			return err
+		}
+	}
 
 	if clearJournal {
-		if err := os.WriteFile(filepath.Join(dir, base+".ecj"), nil, 0o644); err != nil {
-			return fmt.Errorf("create empty delete journal: %w", err)
-		}
-	}
-
-	for _, holder := range holders {
-		ids := byHolder[holder]
-		if err := c.unmountShards(ctx, holder, target.VolumeID, ids); err != nil {
-			return fmt.Errorf("unmount old shards on %s: %w", holder, err)
-		}
-		for _, id := range ids {
-			src := filepath.Join(dir, base+erasure_coding.ToExt(int(id)))
-			if err := c.pushEcFile(ctx, holder, target, erasure_coding.ToExt(int(id)), id, src); err != nil {
-				return fmt.Errorf("push shard %d to %s: %w", id, holder, err)
-			}
-		}
-		// Each holder keeps a self-contained copy of the shared sidecars.
-		for _, ext := range []string{".ecx", ".vif", ".ecsum"} {
-			src := filepath.Join(dir, base+ext)
-			if _, err := os.Stat(src); err != nil {
-				continue
-			}
-			if err := c.pushEcFile(ctx, holder, target, ext, 0, src); err != nil {
-				return fmt.Errorf("push sidecar %s to %s: %w", ext, holder, err)
-			}
-		}
-		if clearJournal {
-			if err := c.pushEcFile(ctx, holder, target, ".ecj", 0, filepath.Join(dir, base+".ecj")); err != nil {
-				return fmt.Errorf("clear delete journal on %s: %w", holder, err)
-			}
-		}
-		if err := c.mountShards(ctx, holder, target, ids); err != nil {
-			return fmt.Errorf("mount compacted shards on %s: %w", holder, err)
-		}
+		c.clearDeleteJournals(ctx, target, dir, base, byDisk, disks)
 	}
 	return nil
+}
+
+// replaceShards points one (holder, disk) at the new generation.
+func (c *ClusterTransport) replaceShards(ctx context.Context, key holderDisk, target VacuumTarget, dir, base string, ids []uint32) error {
+	if err := c.unmountShards(ctx, key.address, target.VolumeID, ids); err != nil {
+		return fmt.Errorf("unmount old shards on %s: %w", key.address, err)
+	}
+	for _, id := range ids {
+		src := filepath.Join(dir, base+erasure_coding.ToExt(int(id)))
+		if err := c.pushEcFile(ctx, key, target, erasure_coding.ToExt(int(id)), id, src); err != nil {
+			return fmt.Errorf("push shard %d to %s: %w", id, key.address, err)
+		}
+	}
+	// Each holder keeps a self-contained copy of the shared sidecars.
+	for _, ext := range []string{".ecx", ".vif", ".ecsum"} {
+		src := filepath.Join(dir, base+ext)
+		if _, err := os.Stat(src); err != nil {
+			continue
+		}
+		if err := c.pushEcFile(ctx, key, target, ext, 0, src); err != nil {
+			return fmt.Errorf("push sidecar %s to %s: %w", ext, key.address, err)
+		}
+	}
+	if err := c.mountShards(ctx, key.address, target, ids); err != nil {
+		return fmt.Errorf("mount compacted shards on %s: %w", key.address, err)
+	}
+	return nil
+}
+
+// clearDeleteJournals overwrites each disk's .ecj with an empty one, so the master
+// stops reporting deletes the compacted generation has already spent. The clear
+// needs the shards unmounted (ReceiveFile refuses while the volume is mounted), and
+// the unmount is per *node*, not per disk: a multi-disk node mounts one EcVolume per
+// disk, and ReceiveFile refuses while the volume is mounted anywhere on it, so a
+// sibling disk left mounted would block every clear. The remount is attempted even
+// when a push failed, so a failure here never leaves shards unmounted. Failures are
+// logged rather than returned — see Redistribute for why they must not fail the
+// vacuum.
+func (c *ClusterTransport) clearDeleteJournals(ctx context.Context, target VacuumTarget, dir, base string, byDisk map[holderDisk][]uint32, disks []holderDisk) {
+	journal := filepath.Join(dir, base+".ecj")
+	if err := os.WriteFile(journal, nil, 0o644); err != nil {
+		glog.Warningf("ec_vacuum: volume %d: cannot prepare an empty delete journal; holders keep theirs: %v", target.VolumeID, err)
+		return
+	}
+	// disks is sorted by (address, disk), so one node's groups are contiguous.
+	for i := 0; i < len(disks); {
+		j := i
+		var nodeIDs []uint32
+		for ; j < len(disks) && disks[j].address == disks[i].address; j++ {
+			nodeIDs = append(nodeIDs, byDisk[disks[j]]...)
+		}
+		c.clearDeleteJournalsOnNode(ctx, target, journal, disks[i:j], nodeIDs)
+		i = j
+	}
+}
+
+// clearDeleteJournalsOnNode unmounts every shard the node holds for the volume,
+// clears each of its disks' journals, and mounts the whole set back.
+func (c *ClusterTransport) clearDeleteJournalsOnNode(ctx context.Context, target VacuumTarget, journal string, groups []holderDisk, nodeIDs []uint32) {
+	address := groups[0].address
+	if err := c.unmountShards(ctx, address, target.VolumeID, nodeIDs); err != nil {
+		// Leave the shards as they are rather than unmounting half of them.
+		glog.Warningf("ec_vacuum: volume %d: %s: cannot unmount to clear the delete journal: %v", target.VolumeID, address, err)
+		return
+	}
+	for _, key := range groups {
+		if err := c.pushEcFile(ctx, key, target, ".ecj", 0, journal); err != nil {
+			glog.Warningf("ec_vacuum: volume %d: %s disk %d: keeps its delete journal; the deletes are already folded into the new index: %v", target.VolumeID, address, key.diskID, err)
+		}
+	}
+	if err := c.mountShards(ctx, address, target, nodeIDs); err != nil {
+		glog.Errorf("ec_vacuum: volume %d: %s: compacted shards are not remounted after the delete-journal clear: %v", target.VolumeID, address, err)
+	}
 }
 
 func (c *ClusterTransport) unmountShards(ctx context.Context, holder string, volumeID uint32, ids []uint32) error {
@@ -314,8 +412,10 @@ func (c *ClusterTransport) mountShards(ctx context.Context, holder string, targe
 		})
 }
 
-// pushEcFile streams one EC shard or sidecar to a holder via ReceiveFile.
-func (c *ClusterTransport) pushEcFile(ctx context.Context, holder string, target VacuumTarget, ext string, shardID uint32, srcPath string) error {
+// pushEcFile streams one EC shard or sidecar to a holder via ReceiveFile, telling
+// the holder which disk the file belongs to so it lands where the shard already
+// lives rather than wherever the server's own disk preference points.
+func (c *ClusterTransport) pushEcFile(ctx context.Context, key holderDisk, target VacuumTarget, ext string, shardID uint32, srcPath string) error {
 	fi, err := os.Stat(srcPath)
 	if err != nil {
 		return err
@@ -326,7 +426,7 @@ func (c *ClusterTransport) pushEcFile(ctx context.Context, holder string, target
 	}
 	defer f.Close()
 
-	return operation.WithVolumeServerClient(false, pb.ServerAddress(holder), c.dialOpt,
+	return operation.WithVolumeServerClient(false, pb.ServerAddress(key.address), c.dialOpt,
 		func(client volume_server_pb.VolumeServerClient) error {
 			stream, err := client.ReceiveFile(ctx)
 			if err != nil {
@@ -340,6 +440,7 @@ func (c *ClusterTransport) pushEcFile(ctx context.Context, holder string, target
 					IsEcVolume: true,
 					ShardId:    shardID,
 					FileSize:   uint64(fi.Size()),
+					DiskId:     key.diskID,
 				}},
 			}); err != nil {
 				return err

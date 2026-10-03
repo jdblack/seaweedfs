@@ -87,22 +87,39 @@ func TestEnumerateGarbageEcVolumesIgnoresStaleGeneration(t *testing.T) {
 	require.Empty(t, candidates, "the newest generation's low delete count wins")
 }
 
-// TestBuildProposalsCapsResults verifies the detection cap and hasMore flag.
-func TestBuildProposalsCapsResults(t *testing.T) {
+// TestBuildProposalsModes verifies each proposal carries the action it was built
+// for, that a decode renders its fullness rather than a deleted ratio, and that a
+// proposal whose mode is absent reads back as a vacuum so queued jobs from before
+// the decode route still execute.
+func TestBuildProposalsModes(t *testing.T) {
 	candidates := []garbageCandidate{
-		{VolumeID: 1, Collection: "c1", FileCount: 10, DeleteCount: 5},
-		{VolumeID: 2, Collection: "c1", FileCount: 10, DeleteCount: 5},
-		{VolumeID: 3, Collection: "c1", FileCount: 10, DeleteCount: 5},
+		{VolumeID: 1, Collection: "c1", FileCount: 10, DeleteCount: 5, SizeReported: true, LiveBytes: 5 << 20},
 	}
 
-	proposals, hasMore := buildProposals(candidates, 2)
-	require.Len(t, proposals, 2)
-	require.True(t, hasMore)
-	require.Equal(t, "ec_vacuum:1:c1:", proposals[0].GetDedupeKey())
+	vacuum := buildProposals(candidates, modeVacuum, 40)
+	require.Len(t, vacuum, 1)
+	require.Equal(t, "vacuum:ec_vacuum:1:c1:", vacuum[0].GetDedupeKey())
+	require.Equal(t, modeVacuum, vacuum[0].GetParameters()[fieldMode].GetStringValue())
+	require.Equal(t, "vacuum", vacuum[0].GetLabels()["action"])
+	require.Contains(t, vacuum[0].GetSummary(), "deleted")
+	require.NotContains(t, vacuum[0].GetDetail(), "fullness")
 
-	all, hasMore := buildProposals(candidates, 0)
-	require.Len(t, all, 3)
-	require.False(t, hasMore)
+	decode := buildProposals(candidates, modeDecode, 40)
+	require.Len(t, decode, 1)
+	require.NotEqual(t, vacuum[0].GetDedupeKey(), decode[0].GetDedupeKey(),
+		"the two actions of one volume must not collide in the admin's dedupe")
+	require.Equal(t, modeDecode, decode[0].GetParameters()[fieldMode].GetStringValue())
+	require.Equal(t, "decode", decode[0].GetLabels()["action"])
+	require.Contains(t, decode[0].GetSummary(), "full")
+	// 5 MB live against a 40 MB limit = 12.5% full.
+	require.Contains(t, decode[0].GetDetail(), "fullness=12.5%")
+
+	// Two modes concatenate, and the caller's cap covers both together.
+	combined := append(buildProposals(candidates, modeDecode, 40), buildProposals(candidates, modeVacuum, 40)...)
+	require.Len(t, combined, 2)
+	require.Equal(t, modeDecode, combined[0].GetParameters()[fieldMode].GetStringValue(),
+		"decode proposals lead, so a cap spends its budget on them first")
+	require.Equal(t, modeVacuum, combined[1].GetParameters()[fieldMode].GetStringValue())
 }
 
 // TestHasAllDataShards guards the decode precondition.

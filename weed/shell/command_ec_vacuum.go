@@ -110,7 +110,11 @@ func (c *commandEcVacuum) Do(args []string, commandEnv *CommandEnv, writer io.Wr
 			}
 		}
 		if len(filtered) == 0 {
-			return fmt.Errorf("EC volume %d is not a vacuum candidate (it may be missing a data shard, span encode generations, or be under the %.0f%% deleted threshold)", vid, *garbageThreshold*100)
+			// An explicit -volumeId bypasses the deleted-ratio gate (see
+			// thresholdForEnumeration above), so the threshold is never the reason
+			// here: the volume is structurally ineligible. Name those reasons, and
+			// the one action that does reclaim a volume with no live needles.
+			return fmt.Errorf("EC volume %d is not a vacuum candidate: it may have no live needles (ec.decode purges such a volume), be missing a data shard, hold duplicate shards, or span encode generations", vid)
 		}
 		candidates = filtered
 	}
