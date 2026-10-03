@@ -177,6 +177,11 @@ func (c *commandEcEncode) Do(args []string, commandEnv *CommandEnv, writer io.Wr
 		fmt.Println("No volumes, nothing to do.")
 		return nil
 	}
+	// fork: a volume no policy covers encodes with the layout in its own .vif,
+	// else the build default. Legitimate, but it must not happen invisibly.
+	if warning := ecPolicyCoverageWarning(commandEnv.option.FilerAddress, topologyInfo, volumeIds); warning != "" {
+		fmt.Fprintf(writer, "%s", warning)
+	}
 	if *batchSize < 0 {
 		return fmt.Errorf("-batchSize must be >= 0")
 	}
