@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -792,6 +793,19 @@ type CopyPartResult struct {
 	ChecksumResult
 }
 
+// MarshalXML writes LastModified in the S3 timestamp format (see xsdDateTime)
+// instead of encoding/xml's RFC 3339 with trimmed fractional seconds.
+func (r CopyPartResult) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+	type T CopyPartResult
+	var layout struct {
+		*T
+		LastModified xsdDateTime `xml:"LastModified"`
+	}
+	layout.T = (*T)(&r)
+	layout.LastModified = xsdDateTime(r.LastModified)
+	return e.EncodeElement(layout, start)
+}
+
 func buildCopyPartResult(etag string, lastModified time.Time, metadata SSEResponseMetadata) CopyPartResult {
 	result := CopyPartResult{
 		ETag:         etag,
@@ -1070,7 +1084,7 @@ func (s3a *S3ApiServer) CopyObjectPartHandler(w http.ResponseWriter, r *http.Req
 		dstChunks, err := s3a.copyChunksForRange(entry, startOffset, endOffset, dstAssignPath)
 		if err != nil {
 			glog.Errorf("CopyObjectPartHandler copy chunks error: %v", err)
-			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+			s3err.WriteErrorResponse(w, r, s3a.mapCopyErrorToS3Error(err))
 			return
 		}
 		dstEntry.Chunks = dstChunks
@@ -1183,7 +1197,11 @@ func processMetadataBytes(reqHeader http.Header, existing map[string][]byte, rep
 			}
 		}
 		for _, h := range copyReplaceSystemHeaders {
-			if v := reqHeader.Get(h); v != "" {
+			v := reqHeader.Get(h)
+			if h == "Content-Encoding" {
+				v = storedContentEncoding(reqHeader.Values(h))
+			}
+			if v != "" {
 				metadata[h] = []byte(v)
 			}
 		}
@@ -1292,7 +1310,7 @@ func (s3a *S3ApiServer) copyChunks(entry *filer_pb.Entry, dstPath string) ([]*fi
 		executor.Execute(func() {
 			dstChunk, err := s3a.copySingleChunk(chunk, dstPath)
 			if err != nil {
-				errChan <- fmt.Errorf("chunk %d: %v", chunkIndex, err)
+				errChan <- fmt.Errorf("chunk %d: %w", chunkIndex, err)
 				return
 			}
 			dstChunks[chunkIndex] = dstChunk
@@ -1426,8 +1444,8 @@ func (s3a *S3ApiServer) assignNewVolume(dstPath string, expectedDataSize uint64)
 		if err != nil {
 			return fmt.Errorf("assign volume: %w", err)
 		}
-		if resp.Error != "" {
-			return fmt.Errorf("assign volume: %v", resp.Error)
+		if err := filer_pb.AssignVolumeResponseError(resp); err != nil {
+			return fmt.Errorf("assign volume: %w", err)
 		}
 		assignResult = resp
 		return nil
@@ -1510,7 +1528,7 @@ func (s3a *S3ApiServer) copyChunksForRange(entry *filer_pb.Entry, startOffset, e
 		executor.Execute(func() {
 			dstChunk, err := s3a.copySingleChunkForRange(originalChunk, chunk, startOffset, endOffset, dstPath)
 			if err != nil {
-				errChan <- fmt.Errorf("chunk %d: %v", chunkIndex, err)
+				errChan <- fmt.Errorf("chunk %d: %w", chunkIndex, err)
 				return
 			}
 			dstChunks[chunkIndex] = dstChunk
@@ -2635,7 +2653,7 @@ func (s3a *S3ApiServer) copyChunksWithReencryption(entry *filer_pb.Entry, copySo
 		executor.Execute(func() {
 			dstChunk, err := s3a.copyChunkWithReencryption(chunk, copySourceKey, destKey, dstPath, entry.Extended, destIV)
 			if err != nil {
-				errChan <- fmt.Errorf("chunk %d: %v", chunkIndex, err)
+				errChan <- fmt.Errorf("chunk %d: %w", chunkIndex, err)
 				return
 			}
 			dstChunks[chunkIndex] = dstChunk

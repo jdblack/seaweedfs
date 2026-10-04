@@ -101,7 +101,7 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 			glog.V(0).Infof("volume %d already exists. deleting before copying from %s...", req.VolumeId, req.SourceDataNode)
 			// keep remote data: the inbound copy carries a .vif that may point at
 			// the same cloud-tier object the existing volume references.
-			if delErr := vs.store.DeleteVolume(needle.VolumeId(req.VolumeId), false, true); delErr != nil {
+			if delErr := vs.store.DeleteVolume(needle.VolumeId(req.VolumeId), false, false, true); delErr != nil {
 				return fmt.Errorf("failed to delete existing volume %d: %v", req.VolumeId, delErr)
 			}
 			glog.V(0).Infof("deleted existing volume %d before copying.", req.VolumeId)
@@ -710,10 +710,16 @@ func (vs *VolumeServer) ReceiveFile(stream volume_server_pb.VolumeServer_Receive
 	var targetFile *os.File
 	var filePath string
 	var bytesWritten uint64
+	// Set while an EC .ecj is being received; released only after the file is
+	// closed and any partial copy removed.
+	var ecjWriteDone func()
 
 	defer func() {
 		if targetFile != nil {
 			targetFile.Close()
+		}
+		if ecjWriteDone != nil {
+			ecjWriteDone()
 		}
 	}()
 
@@ -804,6 +810,13 @@ func (vs *VolumeServer) ReceiveFile(stream volume_server_pb.VolumeServer_Receive
 				// Create EC shard file path
 				baseFileName := erasure_coding.EcShardBaseFileName(fileInfo.Collection, int(fileInfo.VolumeId))
 				filePath = util.Join(targetLocation.Directory, baseFileName+fileInfo.Ext)
+				// The mounted check above runs once; a volume can still mount on
+				// this journal while the stream writes it. Registered as a writer
+				// before the file is created, that mount cannot compact the
+				// journal and leave the rest of the stream in an unlinked inode.
+				if fileInfo.Ext == ".ecj" && ecjWriteDone == nil {
+					ecjWriteDone = erasure_coding.BeginEcjWrite(filePath)
+				}
 			} else {
 				// Regular volume file
 				v := vs.store.GetVolume(needle.VolumeId(fileInfo.VolumeId))

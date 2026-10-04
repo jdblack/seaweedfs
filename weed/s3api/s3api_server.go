@@ -108,7 +108,7 @@ type S3ApiServer struct {
 	icebergCredentialRole     string
 	icebergCredentialDuration int64
 	cipher                    bool // encrypt data on volume servers
-	newObjectWriteLock        func(bucket, object string) objectWriteLock
+	newObjectWriteLock        func(bucket, object string) (objectWriteLock, error)
 	// objectWriteLockClient resolves a key's owner filer for route-by-key.
 	objectWriteLockClient *cluster.LockClient
 	// unreachableOwners holds owners (pb.ServerAddress -> expiry time.Time) whose
@@ -225,15 +225,19 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 				}
 				objectWriteLockClient.SetRing(servers, update.Version)
 			})
+			masterClient.SetOnMasterChangeFn(func(previous, current pb.ServerAddress) {
+				objectWriteLockClient.ResetRing()
+			})
 		}
-		// Start the master client connection loop - required for GetMaster() to work
-		go masterClient.KeepConnectedToMaster(context.Background())
-
 		filerClient = wdclient.NewFilerClient(option.Filers, option.GrpcDialOption, option.DataCenter, &wdclient.FilerClientOption{
 			MasterClient:      masterClient,
 			FilerGroup:        option.FilerGroup,
 			DiscoveryInterval: 5 * time.Minute,
 		})
+		masterClient.SetOnPeerUpdateFn(filerClient.OnPeerUpdate)
+
+		// Start the master client connection loop - required for GetMaster() to work
+		go masterClient.KeepConnectedToMaster(context.Background())
 
 		glog.V(1).Infof("S3 API initialized FilerClient with %d filer(s) and discovery enabled (group: %s, masters: %v)",
 			len(option.Filers), option.FilerGroup, option.Masters)
@@ -345,16 +349,19 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 			objectWriteLockClient = cluster.NewLockClient(option.GrpcDialOption, option.Filers[0])
 		}
 		s3ApiServer.objectWriteLockClient = objectWriteLockClient
-		s3ApiServer.newObjectWriteLock = func(bucket, object string) objectWriteLock {
+		s3ApiServer.newObjectWriteLock = func(bucket, object string) (objectWriteLock, error) {
 			lockKey := objectWriteRouteKeyPrefix + s3ApiServer.toFilerPath(bucket, object)
 			owner := fmt.Sprintf("s3api-%d", s3ApiServer.randomClientId)
 			lock := objectWriteLockClient.NewShortLivedLock(lockKey, owner)
+			if lock == nil {
+				return nil, fmt.Errorf("objectWriteLock: failed to acquire lock for %s", lockKey)
+			}
 			if err := lock.AttemptToLock(objectWriteLockTTL); err != nil {
 				// The initial acquisition already succeeded with the default short TTL.
 				// Renewal to a longer TTL is opportunistic to cover slower metadata paths.
 				glog.Warningf("objectWriteLock: failed to extend lock TTL for %s: %v", lockKey, err)
 			}
-			return lock
+			return lock, nil
 		}
 	}
 
@@ -495,7 +502,7 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 
 	s3ApiServer.registerRouter(router)
 
-	go s3ApiServer.subscribeMetaEvents("s3", startTsNs, filer.DirectoryEtcRoot, []string{
+	watched := []string{
 		option.BucketsPath,
 		filer.IamConfigDirectory,
 		filer.IamConfigDirectory + "/identities",
@@ -503,7 +510,13 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 		filer.IamConfigDirectory + "/service_accounts",
 		filer.IamConfigDirectory + "/groups",
 		filer.IamConfigDirectory + "/oidc-providers",
-	})
+		filer.IamConfigDirectory + "/roles",
+	}
+	// A role store configured with its own basePath is watched there too.
+	if dir := s3ApiServer.roleStoreDir(); !slices.Contains(watched, dir) {
+		watched = append(watched, dir)
+	}
+	go s3ApiServer.subscribeMetaEvents("s3", startTsNs, filer.DirectoryEtcRoot, watched)
 
 	// Start bucket size metrics collection in background
 	go s3ApiServer.startBucketSizeMetricsLoop(context.Background())
@@ -1162,6 +1175,12 @@ func loadIAMManagerFromConfig(configPath string, filerAddressProvider func() str
 		Policy    *policy.PolicyEngineConfig    `json:"policy"`
 		Providers []map[string]interface{}      `json:"providers"`
 		Roles     []*integration.RoleDefinition `json:"roles"`
+		// OIDCProviderStore selects where IAM-managed OIDC providers persist.
+		// Absent, they live in memory and are lost on restart.
+		OIDCProviderStore *integration.OIDCProviderStoreConfig `json:"oidcProviderStore"`
+		// RoleStore selects where roles persist. Absent, they live in memory and
+		// only the roles in this file exist.
+		RoleStore *integration.RoleStoreConfig `json:"roleStore"`
 		Policies  []struct {
 			Name     string                 `json:"name"`
 			Document *policy.PolicyDocument `json:"document"`
@@ -1207,13 +1226,30 @@ func loadIAMManagerFromConfig(configPath string, filerAddressProvider func() str
 		glog.V(1).Infof("Using policy defaults: DefaultEffect=%s, StoreType=%s", configRoot.Policy.DefaultEffect, configRoot.Policy.StoreType)
 	}
 
+	// With no IAM config file there is nothing static for a persisted
+	// provider or role to shadow or outlive, so those created at runtime
+	// default to the filer, where restarts and peer S3 servers see them. A
+	// config file keeps the in-memory defaults unless it sets
+	// oidcProviderStore / roleStore.
+	persistByDefault := configPath == "" && filerAddressProvider != nil
+	oidcProviderStore := configRoot.OIDCProviderStore
+	if oidcProviderStore == nil && persistByDefault {
+		oidcProviderStore = &integration.OIDCProviderStoreConfig{StoreType: "filer"}
+	}
+	roleStore := configRoot.RoleStore
+	if roleStore == nil {
+		roleStore = &integration.RoleStoreConfig{StoreType: sts.StoreTypeMemory}
+		if persistByDefault {
+			roleStore = &integration.RoleStoreConfig{StoreType: "filer"}
+		}
+	}
+
 	// Create IAM configuration
 	iamConfig := &integration.IAMConfig{
-		STS:    configRoot.STS,
-		Policy: configRoot.Policy,
-		Roles: &integration.RoleStoreConfig{
-			StoreType: sts.StoreTypeMemory, // Use memory store for JSON config-based setup
-		},
+		STS:           configRoot.STS,
+		Policy:        configRoot.Policy,
+		Roles:         roleStore,
+		OIDCProviders: oidcProviderStore,
 	}
 
 	// Apply default signing key if not present in config
@@ -1296,11 +1332,7 @@ func loadIAMManagerFromConfig(configPath string, filerAddressProvider func() str
 	}
 
 	// Load roles
-	for _, roleDef := range configRoot.Roles {
-		if err := iamManager.CreateRole(context.Background(), "", roleDef.RoleName, roleDef); err != nil {
-			glog.Warningf("Failed to create role %s: %v", roleDef.RoleName, err)
-		}
-	}
+	iamManager.LoadStaticRoles(context.Background(), configRoot.Roles)
 
 	glog.V(1).Infof("Loaded %d providers, %d policies and %d roles from config", len(configRoot.Providers), len(configRoot.Policies), len(configRoot.Roles))
 

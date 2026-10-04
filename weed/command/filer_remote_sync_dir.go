@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -20,6 +21,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/replication/source"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -41,14 +44,6 @@ func followUpdatesAndUploadToRemote(option *RemoteSyncOptions, filerSource *sour
 
 	var lastLogTsNs = time.Now().UnixNano()
 	processEventFnWithOffset := pb.AddOffsetFunc(func(resp *filer_pb.SubscribeMetadataResponse) error {
-		if resp.EventNotification.NewEntry != nil {
-			if *option.storageClass == "" {
-				delete(resp.EventNotification.NewEntry.Extended, s3_constants.AmzStorageClass)
-			} else {
-				resp.EventNotification.NewEntry.Extended[s3_constants.AmzStorageClass] = []byte(*option.storageClass)
-			}
-		}
-
 		processor.AddSyncJob(resp)
 		return nil
 	}, 3*time.Second, func(counter int64, lastTsNs int64) error {
@@ -81,6 +76,10 @@ func followUpdatesAndUploadToRemote(option *RemoteSyncOptions, filerSource *sour
 		StartTsNs:              lastOffsetTs.UnixNano(),
 		StopTsNs:               0,
 		EventErrorType:         pb.RetryForeverOnError,
+		GetResumeTsNs: func() int64 {
+			return processor.processedTsWatermark.Load()
+		},
+		Resubscribe: processor.ResubscribeCh(),
 	}
 
 	return pb.FollowMetadata(pb.ServerAddress(*option.filerAddress), option.grpcDialOption, metadataFollowOption, processEventFnWithOffset)
@@ -175,10 +174,9 @@ func (option *RemoteSyncOptions) makeEventProcessor(remoteStorage *remote_pb.Rem
 			dest := toRemoteStorageLocation(util.FullPath(mountedDir), util.NewFullPath(parentPath, entryName), remoteStorageMountLocation)
 			if message.NewEntry.IsDirectory {
 				glog.V(0).Infof("mkdir  %s", remote_storage.FormatLocation(dest))
-				return client.WriteDirectory(dest, message.NewEntry)
+				return client.WriteDirectory(dest, remoteWriteEntry(message.NewEntry, *option.storageClass))
 			}
-			glog.V(0).Infof("create %s", remote_storage.FormatLocation(dest))
-			remoteEntry, writeErr := retriedWriteFile(client, filerSource, message.NewParentPath, message.NewEntry, dest)
+			remoteEntry, writeErr := retriedWriteFile(client, filerSource, message.NewParentPath, remoteWriteEntry(message.NewEntry, *option.storageClass), dest)
 			if errors.Is(writeErr, errSuperseded) {
 				glog.Errorf("skipping %s: %v", remote_storage.FormatLocation(dest), writeErr)
 				return nil
@@ -197,23 +195,10 @@ func (option *RemoteSyncOptions) makeEventProcessor(remoteStorage *remote_pb.Rem
 			return updateLocalEntry(option, message.NewParentPath, message.NewEntry, remoteEntry)
 		}
 		if filer_pb.IsDelete(resp) {
-			// Skip deletion of internal version files; individual version
-			// deletes should not propagate to the remote object
-			if isVersionedPath(resp.Directory, message.OldEntry.Name, message.OldEntry.IsDirectory) {
-				glog.V(2).Infof("skipping delete of internal version path: %s/%s", resp.Directory, message.OldEntry.Name)
-				return nil
-			}
-			glog.V(2).Infof("delete: %+v", resp)
-			dest := toRemoteStorageLocation(util.FullPath(mountedDir), util.NewFullPath(resp.Directory, message.OldEntry.Name), remoteStorageMountLocation)
-			if message.OldEntry.IsDirectory {
-				glog.V(0).Infof("rmdir  %s", remote_storage.FormatLocation(dest))
-				return client.RemoveDirectory(dest)
-			}
-			glog.V(0).Infof("delete %s", remote_storage.FormatLocation(dest))
-			return client.DeleteFile(dest)
+			return processDeleteEvent(client, mountedDir, remoteStorageMountLocation, resp)
 		}
 		if message.OldEntry != nil && message.NewEntry != nil {
-			return processUpdateEvent(option, filerSource, client, mountedDir, remoteStorageMountLocation, resp)
+			return processUpdateEvent(option, filerSource, *option.storageClass, client, mountedDir, remoteStorageMountLocation, resp)
 		}
 
 		return nil
@@ -221,9 +206,49 @@ func (option *RemoteSyncOptions) makeEventProcessor(remoteStorage *remote_pb.Rem
 	return eachEntryFunc, nil
 }
 
+// processDeleteEvent removes the remote object an entry mapped to. A remote
+// object that is already absent counts as deleted: the entry was never
+// uploaded (created and deleted faster than the sync ran, or a replay of an
+// event the inline delete already handled), and GCS reports that case as
+// ErrRemoteObjectNotFound where S3 and Azure answer an idempotent success.
+// Returning the error would pin the sync offset on an event that has nothing
+// left to do.
+func processDeleteEvent(
+	client remote_storage.RemoteStorageClient,
+	mountedDir string,
+	remoteStorageMountLocation *remote_pb.RemoteStorageLocation,
+	resp *filer_pb.SubscribeMetadataResponse,
+) error {
+	message := resp.EventNotification
+	// Skip deletion of internal version files; individual version
+	// deletes should not propagate to the remote object
+	if isVersionedPath(resp.Directory, message.OldEntry.Name, message.OldEntry.IsDirectory) {
+		glog.V(2).Infof("skipping delete of internal version path: %s/%s", resp.Directory, message.OldEntry.Name)
+		return nil
+	}
+	glog.V(2).Infof("delete: %+v", resp)
+	dest := toRemoteStorageLocation(util.FullPath(mountedDir), util.NewFullPath(resp.Directory, message.OldEntry.Name), remoteStorageMountLocation)
+	if message.OldEntry.IsDirectory {
+		glog.V(0).Infof("rmdir  %s", remote_storage.FormatLocation(dest))
+		return client.RemoveDirectory(dest)
+	}
+	glog.V(0).Infof("delete %s", remote_storage.FormatLocation(dest))
+	return deleteRemoteFile(client, dest)
+}
+
+// deleteRemoteFile deletes the object and treats an already-absent object as
+// deleted.
+func deleteRemoteFile(client remote_storage.RemoteStorageClient, dest *remote_pb.RemoteStorageLocation) error {
+	if err := client.DeleteFile(dest); err != nil && !errors.Is(err, remote_storage.ErrRemoteObjectNotFound) {
+		return err
+	}
+	return nil
+}
+
 func processUpdateEvent(
 	filerClient filer_pb.FilerClient,
 	filerSource filer_pb.FilerClient,
+	storageClass string,
 	client remote_storage.RemoteStorageClient,
 	mountedDir string,
 	remoteStorageMountLocation *remote_pb.RemoteStorageLocation,
@@ -244,7 +269,7 @@ func processUpdateEvent(
 		return nil
 	}
 	if message.NewEntry.IsDirectory {
-		return client.WriteDirectory(dest, message.NewEntry)
+		return client.WriteDirectory(dest, remoteWriteEntry(message.NewEntry, storageClass))
 	}
 	if isMetadataOnlyUpdate(resp.Directory, message) {
 		remoteEntry, err := liveRemoteEntry(filerClient, message.NewParentPath, message.NewEntry)
@@ -257,16 +282,26 @@ func processUpdateEvent(
 		}
 		if remoteEntry != nil {
 			glog.V(2).Infof("update meta: %+v", resp)
-			return client.UpdateFileMetadata(dest, message.OldEntry, message.NewEntry)
+			return client.UpdateFileMetadata(dest, message.OldEntry, remoteWriteEntry(message.NewEntry, storageClass))
 		}
 		glog.V(0).Infof("never replicated, uploading %s", remote_storage.FormatLocation(dest))
 	}
-	if !proto.Equal(oldDest, dest) && !filer.HasData(message.NewEntry) && message.NewEntry.IsInRemoteOnly() {
-		glog.V(0).Infof("skip uploading renamed remote-only entry %s: content is only on the deleted remote object", remote_storage.FormatLocation(dest))
-		return nil
-	}
 	glog.V(2).Infof("update: %+v", resp)
 	if !proto.Equal(oldDest, dest) {
+		// A renamed entry that holds no local data now (the snapshot was
+		// remote-only, or remote.uncache ran since) has its content only as a
+		// remote object. Remote-only reads resolve by the entry's own path, so
+		// the rename completes only once the destination object holds it. The
+		// filer's current state decides, not the snapshot: an entry rewritten
+		// since the event has local data again, and the rewrite's bytes are
+		// what the destination must hold.
+		current, err := currentEntry(filerSource, message.NewParentPath, message.NewEntry.Name)
+		if err != nil {
+			return err
+		}
+		if isRemoteOnly(current) {
+			return completeRemoteOnlyRename(filerClient, client, message.NewParentPath, current, oldDest, dest, storageClass)
+		}
 		glog.V(0).Infof("delete %s", remote_storage.FormatLocation(oldDest))
 		if err := client.DeleteFile(oldDest); err != nil {
 			if isMultipartUploadFile(resp.Directory, message.OldEntry.Name) {
@@ -277,7 +312,132 @@ func processUpdateEvent(
 			}
 		}
 	}
-	remoteEntry, writeErr := retriedWriteFile(client, filerSource, message.NewParentPath, message.NewEntry, dest)
+	remoteEntry, writeErr := retriedWriteFile(client, filerSource, message.NewParentPath, remoteWriteEntry(message.NewEntry, storageClass), dest)
+	if errors.Is(writeErr, errSuperseded) {
+		glog.Errorf("skipping %s: %v", remote_storage.FormatLocation(dest), writeErr)
+		if !proto.Equal(oldDest, dest) {
+			return uploadCurrentEntry(filerClient, filerSource, client, message.NewParentPath, message.NewEntry.Name, oldDest, dest, storageClass)
+		}
+		return nil
+	}
+	if writeErr != nil {
+		return writeErr
+	}
+	return updateLocalEntry(filerClient, message.NewParentPath, message.NewEntry, remoteEntry)
+}
+
+// currentEntry returns what the filer holds at dir/name now, nil when the
+// entry is gone.
+func currentEntry(filerSource filer_pb.FilerClient, dir, name string) (*filer_pb.Entry, error) {
+	current, _, _, err := filer_pb.GetEntry(context.Background(), filerSource, util.NewFullPath(dir, name))
+	if errors.Is(err, filer_pb.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return current, nil
+}
+
+// isRemoteOnly reports an entry whose content exists only as its remote
+// object: no local data, a RemoteEntry with a size.
+func isRemoteOnly(entry *filer_pb.Entry) bool {
+	return entry != nil && !filer.HasData(entry) && entry.IsInRemoteOnly()
+}
+
+// completeRemoteOnlyRename finishes a rename whose content exists only on the
+// remote. When the destination object already holds what the entry's stamp
+// describes (the rename ran before, its offset was not persisted, and
+// remote.uncache followed), the old key goes. Otherwise the old object is
+// copied over the destination, the entry is stamped with the copy, and the
+// old key goes. With neither object present the content is lost: the event
+// fails and holds the offset for recovery.
+func completeRemoteOnlyRename(filerClient filer_pb.FilerClient, client remote_storage.RemoteStorageClient, dir string, current *filer_pb.Entry, oldDest, dest *remote_pb.RemoteStorageLocation, storageClass string) error {
+	if existing, err := client.StatFile(dest); err == nil {
+		if describes(current.RemoteEntry, existing) {
+			glog.V(0).Infof("%s already holds the renamed content", remote_storage.FormatLocation(dest))
+			return deleteRemoteFile(client, oldDest)
+		}
+		glog.V(0).Infof("%s holds an object the entry does not describe (size %d, want %d); replacing it from %s", remote_storage.FormatLocation(dest), existing.RemoteSize, current.RemoteEntry.RemoteSize, remote_storage.FormatLocation(oldDest))
+	} else if !errors.Is(err, remote_storage.ErrRemoteObjectNotFound) {
+		return err
+	}
+	stat, err := client.StatFile(oldDest)
+	if errors.Is(err, remote_storage.ErrRemoteObjectNotFound) {
+		return fmt.Errorf("%s: content is on neither %s nor %s", util.NewFullPath(dir, current.Name), remote_storage.FormatLocation(oldDest), remote_storage.FormatLocation(dest))
+	}
+	if err != nil {
+		return err
+	}
+	reader, err := openRemoteObject(client, oldDest, stat.RemoteSize)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	glog.V(0).Infof("copy %s -> %s", remote_storage.FormatLocation(oldDest), remote_storage.FormatLocation(dest))
+	remoteEntry, err := client.WriteFile(dest, remoteWriteEntry(current, storageClass), reader)
+	if err != nil {
+		return err
+	}
+	if err := updateLocalEntry(filerClient, dir, current, remoteEntry); err != nil {
+		return err
+	}
+	return deleteRemoteFile(client, oldDest)
+}
+
+// describes reports whether the object a stat returned is the one the entry's
+// stamp describes: same size, and the same ETag when both sides carry one (a
+// copy written as one stream can legitimately carry a different ETag from a
+// multipart original).
+func describes(stamp, object *filer_pb.RemoteEntry) bool {
+	if stamp == nil || object == nil || stamp.RemoteSize != object.RemoteSize {
+		return false
+	}
+	return stamp.RemoteETag == "" || object.RemoteETag == "" || stamp.RemoteETag == object.RemoteETag
+}
+
+// openRemoteObject streams the object when the client can, and reads it whole
+// otherwise.
+func openRemoteObject(client remote_storage.RemoteStorageClient, loc *remote_pb.RemoteStorageLocation, size int64) (io.ReadCloser, error) {
+	if streamer, ok := client.(remote_storage.RemoteStorageStreamReader); ok {
+		return streamer.ReadFileAsStream(context.Background(), loc, 0, size)
+	}
+	data, err := client.ReadFile(loc, 0, size)
+	if err != nil {
+		return nil, err
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+// uploadCurrentEntry uploads what the filer holds at dir/name now, when the
+// event that superseded this rename will not. A rename whose snapshot is
+// superseded has already deleted the old key; the rewrite behind it in the
+// log uploads the destination itself unless shouldSendToRemote skips it on
+// the inherited RemoteEntry, whose RemoteMtime can equal the rewrite's mtime
+// within the same second. Only that case uploads here, so the content goes
+// up once. A remote-only entry is finished the way completeRemoteOnlyRename
+// finishes a rename: its stamp can already describe the destination (a sync
+// plus remote.uncache in the meantime), and only then is it complete.
+func uploadCurrentEntry(filerClient filer_pb.FilerClient, filerSource filer_pb.FilerClient, client remote_storage.RemoteStorageClient, dir, name string, oldDest, dest *remote_pb.RemoteStorageLocation, storageClass string) error {
+	current, _, _, err := filer_pb.GetEntry(context.Background(), filerSource, util.NewFullPath(dir, name))
+	if errors.Is(err, filer_pb.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if current.IsDirectory {
+		return nil
+	}
+	if isRemoteOnly(current) {
+		return completeRemoteOnlyRename(filerClient, client, dir, current, oldDest, dest, storageClass)
+	}
+	if shouldSendToRemote(current) {
+		glog.V(0).Infof("leaving %s to the rewrite that superseded the rename", remote_storage.FormatLocation(dest))
+		return nil
+	}
+	glog.V(0).Infof("uploading the current %s in place of the superseded rename", remote_storage.FormatLocation(dest))
+	remoteEntry, writeErr := retriedWriteFile(client, filerSource, dir, remoteWriteEntry(current, storageClass), dest)
 	if errors.Is(writeErr, errSuperseded) {
 		glog.Errorf("skipping %s: %v", remote_storage.FormatLocation(dest), writeErr)
 		return nil
@@ -285,7 +445,7 @@ func processUpdateEvent(
 	if writeErr != nil {
 		return writeErr
 	}
-	return updateLocalEntry(filerClient, message.NewParentPath, message.NewEntry, remoteEntry)
+	return updateLocalEntry(filerClient, dir, current, remoteEntry)
 }
 
 // isSuperseded reports whether the filer has moved past the entry an event
@@ -309,6 +469,12 @@ func isSuperseded(filerClient filer_pb.FilerClient, dir string, entry *filer_pb.
 	if err != nil {
 		return false
 	}
+	if !filer.HasData(entry) && filer.HasData(current) {
+		// The event described an entry without data (remote-only, or empty);
+		// the filer has written to it since. Uploading the snapshot would put
+		// an empty object where the write belongs.
+		return true
+	}
 	if len(entry.Content) > 0 || len(current.Content) > 0 {
 		return !bytes.Equal(entry.Content, current.Content)
 	}
@@ -319,11 +485,18 @@ func isSuperseded(filerClient filer_pb.FilerClient, dir string, entry *filer_pb.
 // moved past (isSuperseded). The caller skips the event instead of failing it.
 var errSuperseded = errors.New("deleted or rewritten since the event was logged")
 
-// retriedWriteFile uploads the entry, retrying transient failures. Every failed
-// attempt first asks the filer whether the entry is superseded, and stops at
-// once when it is: a dead chunk reads as a transient "RequestError" from the
-// SDK, and waiting out the backoff on it buys nothing.
+// retriedWriteFile uploads the entry, retrying transient failures. The filer is
+// asked whether the entry is superseded before the first attempt and after
+// every failed one, and the upload stops at once when it is. Before: a backlog
+// (a restart resuming from an old offset) carries every intermediate version
+// of a hot file, and uploading each one in turn is wasted bandwidth that can
+// trip the remote's per-object mutation rate limit; only the version the filer
+// still holds is worth sending. After: a dead chunk reads as a transient
+// "RequestError" from the SDK, and waiting out the backoff on it buys nothing.
 func retriedWriteFile(client remote_storage.RemoteStorageClient, filerSource filer_pb.FilerClient, dir string, newEntry *filer_pb.Entry, dest *remote_pb.RemoteStorageLocation) (remoteEntry *filer_pb.RemoteEntry, err error) {
+	if isSuperseded(filerSource, dir, newEntry) {
+		return nil, fmt.Errorf("%s %w", util.NewFullPath(dir, newEntry.Name), errSuperseded)
+	}
 	err = util.RetryOnError("writeFile", func(err error) bool {
 		return !errors.Is(err, errSuperseded) && util.IsTransientError(err)
 	}, func() error {
@@ -367,6 +540,11 @@ func collectLastSyncOffset(filerClient filer_pb.FilerClient, grpcDialOption grpc
 		}
 	} else {
 		lastOffsetTs = time.Now().Add(-timeAgo)
+		if lastOffsetTsNs, err := remote_storage.GetSyncOffset(grpcDialOption, filerAddress, mountedDir); err == nil && lastOffsetTsNs > 0 {
+			if savedOffsetTs := time.Unix(0, lastOffsetTsNs); savedOffsetTs.Before(lastOffsetTs) {
+				lastOffsetTs = savedOffsetTs
+			}
+		}
 	}
 	return lastOffsetTs
 }
@@ -417,16 +595,86 @@ func shouldSendToRemote(entry *filer_pb.Entry) bool {
 	return false
 }
 
+// remoteWriteEntry returns the entry as remote storage should see it: the
+// storage class attribute is dropped, or overridden by -storageClass. The
+// event entry is left untouched so updateLocalEntry still compares the entry
+// the filer stored.
+func remoteWriteEntry(entry *filer_pb.Entry, storageClass string) *filer_pb.Entry {
+	clone := proto.Clone(entry).(*filer_pb.Entry)
+	if storageClass == "" {
+		delete(clone.Extended, s3_constants.AmzStorageClass)
+	} else {
+		if clone.Extended == nil {
+			clone.Extended = map[string][]byte{}
+		}
+		clone.Extended[s3_constants.AmzStorageClass] = []byte(storageClass)
+	}
+	return clone
+}
+
+// updateLocalEntry stamps the entry an event described with its RemoteEntry.
+// The write carries IF_ENTRY_EQUAL over the event's entry: the filer deletes
+// every stored chunk absent from an updated entry, so a snapshot older than
+// the live entry (the file was rewritten while its upload was in flight, or
+// the event is a replay) would delete the live chunks. A failed precondition
+// means the filer moved past this event; the event that superseded it follows
+// in the log and stamps the current entry, so the stale stamp is skipped the
+// same way a superseded upload is.
 func updateLocalEntry(filerClient filer_pb.FilerClient, dir string, entry *filer_pb.Entry, remoteEntry *filer_pb.RemoteEntry) error {
 	remoteEntry.LastLocalSyncTsNs = time.Now().UnixNano()
+	expected := proto.Clone(entry).(*filer_pb.Entry)
 	entry.RemoteEntry = remoteEntry
-	return filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+	err := filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 		_, err := client.UpdateEntry(context.Background(), &filer_pb.UpdateEntryRequest{
 			Directory: dir,
 			Entry:     entry,
+			Condition: ifEntryEqual(expected),
 		})
 		return err
 	})
+	if isFailedPrecondition(err) {
+		glog.Errorf("skipping stale stamp of %s: %v", util.NewFullPath(dir, entry.Name), err)
+		return nil
+	}
+	if isEntryGone(err) {
+		glog.Errorf("skipping stamp of %s: deleted since the event was logged: %v", util.NewFullPath(dir, entry.Name), err)
+		return nil
+	}
+	return err
+}
+
+// isEntryGone reports an UpdateEntry the filer refused because the entry no
+// longer exists: a delete that followed the event superseded the stamp, and
+// the delete's own event follows in the log. A filer with the typed answer
+// returns codes.NotFound; an older filer returns a plain error of the form
+// "not found <path>: <cause>", so the cause (the message's tail, never the
+// path) is matched against filer_pb.ErrNotFound's text.
+func isEntryGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
+		return true
+	}
+	return strings.HasSuffix(strings.TrimSpace(err.Error()), filer_pb.ErrNotFound.Error())
+}
+
+// ifEntryEqual builds the precondition that the stored entry still equals the
+// one the event described: chunk fids, inline content, and metadata alike.
+func ifEntryEqual(entry *filer_pb.Entry) *filer_pb.WriteCondition {
+	return &filer_pb.WriteCondition{
+		Clauses: []*filer_pb.WriteCondition_Clause{{Kind: filer_pb.WriteCondition_IF_ENTRY_EQUAL, ExpectedEntry: entry}},
+	}
+}
+
+// isFailedPrecondition reports a write condition the filer refused, through
+// any wrapping WithFilerClient added.
+func isFailedPrecondition(err error) bool {
+	if err == nil {
+		return false
+	}
+	st, ok := status.FromError(err)
+	return ok && st.Code() == codes.FailedPrecondition
 }
 
 func isMultipartUploadFile(dir string, name string) bool {
@@ -456,7 +704,7 @@ func syncDeleteMarker(
 	dest *remote_pb.RemoteStorageLocation,
 ) error {
 	glog.V(0).Infof("delete (marker) %s", remote_storage.FormatLocation(dest))
-	if err := client.DeleteFile(dest); err != nil {
+	if err := deleteRemoteFile(client, dest); err != nil {
 		return err
 	}
 	return updateLocalEntry(filerClient, message.NewParentPath, message.NewEntry, &filer_pb.RemoteEntry{

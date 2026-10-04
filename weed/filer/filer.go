@@ -7,6 +7,8 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/remote_storage"
@@ -22,6 +24,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
 
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -44,17 +47,22 @@ var (
 )
 
 type Filer struct {
-	UniqueFilerId                 int32
-	UniqueFilerEpoch              int32
-	Store                         VirtualFilerStore
-	MasterClient                  *wdclient.MasterClient
-	FileIdDeletionQueue           *util.UnboundedQueue
-	GrpcDialOption                grpc.DialOption
-	DirBucketsPath                string
-	Cipher                        bool
-	LocalMetaLogBuffer            *log_buffer.LogBuffer
-	metaLogCollection             string
-	metaLogReplication            string
+	UniqueFilerId       int32
+	UniqueFilerEpoch    int32
+	Store               VirtualFilerStore
+	MasterClient        *wdclient.MasterClient
+	FileIdDeletionQueue *util.UnboundedQueue
+	GrpcDialOption      grpc.DialOption
+	DirBucketsPath      string
+	Cipher              bool
+	LocalMetaLogBuffer  *log_buffer.LogBuffer
+	metaLogCollection   string
+	metaLogReplication  string
+	// Override where system metadata-log chunks are assigned, keeping the
+	// internal log out of the default collection; empty keeps today's
+	// behaviour. Set via viper: filer.options.metaLog.collection / .replication.
+	metaLogTargetCollection       string
+	metaLogTargetReplication      string
 	DefaultDiskType               string
 	MetaAggregator                *MetaAggregator
 	Signature                     int32
@@ -73,6 +81,35 @@ type Filer struct {
 	EmptyFolderCleanupDelay       time.Duration
 	persistedLogCache             *persistedLogCache
 	metaLogInflight               metaLogInflight
+	remoteTombstones              *remoteDeletionTombstones
+	// remoteTombstonesDone, when non-nil, is closed once the startup tombstone
+	// rebuild finishes; lazy remote reads wait on it so a pending delete
+	// cannot resurrect in the gap.
+	remoteTombstonesDone atomic.Pointer[chan struct{}]
+
+	// Durable deletion ledger (see filer_deletion_persist.go). The set of
+	// fileIds that still need deleting but are not yet confirmed gone, mirrored
+	// to the store so a restart does not leak chunks. Guarded by
+	// deletionLedgerLock; nil-safe for Filer literals in tests.
+	// pendingDeletions maps each id to its enqueue epoch so an expiry-forget
+	// cannot erase a re-queued id.
+	deletionLedgerLock  sync.Mutex
+	pendingDeletions    map[string]uint64
+	deletionSeq         uint64
+	deletionLedgerDirty bool
+	deletionLedgerParts int
+	deletionLedgerGen   int
+	// deletionLedgerStale holds orphan part keys from abandoned multipart
+	// writes, retried on the next snapshot.
+	deletionLedgerStale []string
+	// deletionSnapshotLock serializes ledger writes in copy order so an
+	// in-flight timer snapshot cannot overwrite a newer shutdown snapshot.
+	deletionSnapshotLock sync.Mutex
+	// deletionLedgerBlocked is set when the startup ledger read fails: the
+	// persisted set is then unknown, so snapshots retry the read instead of
+	// overwriting the unread ledger with a partial set.
+	deletionLedgerBlocked atomic.Bool
+	deletionLedgerFlush   chan struct{}
 }
 
 func NewFiler(masters pb.ServerDiscovery, grpcDialOption grpc.DialOption, filerHost pb.ServerAddress, filerGroup string, collection string, replication string, dataCenter string, maxFilenameLength uint32, notifyFn func()) *Filer {
@@ -86,8 +123,10 @@ func NewFiler(masters pb.ServerDiscovery, grpcDialOption grpc.DialOption, filerH
 		Dlm:                 lock_manager.NewDistributedLockManager(filerHost),
 		MaxFilenameLength:   maxFilenameLength,
 		deletionQuit:        make(chan struct{}),
+		deletionLedgerFlush: make(chan struct{}, 1),
 		DeletionRetryQueue:  NewDeletionRetryQueue(),
 		persistedLogCache:   newPersistedLogCache(persistedLogCacheMaxBytes),
+		remoteTombstones:    newRemoteDeletionTombstones(),
 	}
 	if f.UniqueFilerId < 0 {
 		f.UniqueFilerId = -f.UniqueFilerId
@@ -102,6 +141,19 @@ func NewFiler(masters pb.ServerDiscovery, grpcDialOption grpc.DialOption, filerH
 	f.LocalMetaLogBuffer = log_buffer.NewLogBuffer("local", LogFlushInterval, f.logFlushFunc, nil, notifyFn)
 	f.metaLogCollection = collection
 	f.metaLogReplication = replication
+
+	// Optional override for where the system metadata-log chunks land, so
+	// operators can keep internal log volumes out of the default collection.
+	// Unset (""), this changes nothing: meta logs keep following the filer
+	// default exactly as before.
+	v := util.GetViper()
+	v.SetDefault("filer.options.metaLog.collection", "")
+	v.SetDefault("filer.options.metaLog.replication", "")
+	f.metaLogTargetCollection = v.GetString("filer.options.metaLog.collection")
+	f.metaLogTargetReplication = v.GetString("filer.options.metaLog.replication")
+	if f.metaLogTargetCollection != "" {
+		glog.V(0).Infof("system metadata logs will be stored in collection %q", f.metaLogTargetCollection)
+	}
 
 	if newPlacementOverlay != nil {
 		f.placementOverlay = newPlacementOverlay(f)
@@ -174,6 +226,10 @@ func (f *Filer) AggregateFromPeers(self pb.ServerAddress, existingNodes []*maste
 		glog.V(0).Infof("LockRing: applying master ring update v%d: %v", update.Version, servers)
 		f.Dlm.LockRing.SetSnapshot(servers, update.Version)
 	})
+	f.MasterClient.SetOnMasterChangeFn(func(previous, current pb.ServerAddress) {
+		glog.V(0).Infof("LockRing: master changed %s -> %s, resetting ring", previous, current)
+		f.Dlm.LockRing.Reset()
+	})
 
 	// Subscribe to the local filer first: its events reach the aggregated
 	// buffer only through this subscription, and the peer watermarks must
@@ -198,7 +254,16 @@ func (f *Filer) ListExistingPeerUpdates(ctx context.Context) (existingNodes []*m
 func (f *Filer) SetStore(store FilerStore) (isFresh bool) {
 	f.Store = NewFilerStoreWrapper(store)
 
-	return f.setOrLoadFilerStoreSignature(store)
+	isFresh = f.setOrLoadFilerStoreSignature(store)
+
+	// Recover deletions that were pending when a previous process died, and keep
+	// the durable ledger snapshotted while running (see filer_deletion_persist.go).
+	// A failed ledger read leaves writes blocked until a snapshot retries and
+	// the read succeeds, so the unread ledger is never overwritten.
+	f.reloadDeletionLedger()
+	f.startDeletionLedgerSnapshotter()
+
+	return isFresh
 }
 
 func (f *Filer) setOrLoadFilerStoreSignature(store FilerStore) (isFresh bool) {
@@ -265,7 +330,13 @@ func (f *Filer) CreateEntry(ctx context.Context, entry *Entry, existing *Entry, 
 
 	oldEntry := existing
 	if oldEntry == nil {
-		oldEntry, _ = f.FindEntry(ctx, entry.FullPath)
+		var findErr error
+		oldEntry, findErr = f.FindEntry(ctx, entry.FullPath)
+		if o_excl && findErr != nil && !errors.Is(findErr, filer_pb.ErrNotFound) {
+			// An exclusive create cannot decide whether the path exists when
+			// the lookup itself failed; proceeding would upsert over it.
+			return fmt.Errorf("find entry %s: %w", entry.FullPath, findErr)
+		}
 	}
 
 	/*
@@ -310,7 +381,7 @@ func (f *Filer) CreateEntry(ctx context.Context, entry *Entry, existing *Entry, 
 			return fmt.Errorf("%s: %w", entry.FullPath, filer_pb.ErrEntryAlreadyExists)
 		}
 		glog.V(4).InfofCtx(ctx, "UpdateEntry %s: old entry: %v", entry.FullPath, oldEntry.Name())
-		if err := f.UpdateEntry(ctx, oldEntry, entry); err != nil {
+		if err := f.UpdateEntry(ctx, oldEntry, entry, isFromOtherCluster); err != nil {
 			if errors.Is(err, filer_pb.ErrExistingIsDirectory) || errors.Is(err, filer_pb.ErrExistingIsFile) {
 				glog.V(2).InfofCtx(ctx, "update entry %s: %v", entry.FullPath, err)
 			} else {
@@ -465,7 +536,7 @@ func (f *Filer) EnsureDirectoryEntry(ctx context.Context, dirPath util.FullPath,
 		narrowed := existing.ShallowClone()
 		narrowed.Mode = existing.Mode&^restorableModeBits | kept
 		glog.V(1).InfofCtx(ctx, "restore directory %s: narrowing %v to %v", dirPath, existing.Mode, narrowed.Mode)
-		if err := f.UpdateEntry(ctx, existing, narrowed); err != nil {
+		if err := f.UpdateEntry(ctx, existing, narrowed, false); err != nil {
 			return err
 		}
 		f.NotifyUpdateEvent(ctx, existing, narrowed, false, false, nil)
@@ -498,7 +569,7 @@ func (f *Filer) EnsureDirectoryEntry(ctx context.Context, dirPath util.FullPath,
 	return nil
 }
 
-func (f *Filer) UpdateEntry(ctx context.Context, oldEntry, entry *Entry) (err error) {
+func (f *Filer) UpdateEntry(ctx context.Context, oldEntry, entry *Entry, isFromOtherCluster bool) (err error) {
 	if oldEntry != nil {
 		entry.Attr.Crtime = oldEntry.Attr.Crtime
 		if oldEntry.Attr.Inode != 0 {
@@ -517,6 +588,17 @@ func (f *Filer) UpdateEntry(ctx context.Context, oldEntry, entry *Entry) (err er
 		if !oldEntry.IsDirectory() && entry.IsDirectory() {
 			glog.V(2).InfofCtx(ctx, "existing %s is a file", oldEntry.FullPath)
 			return fmt.Errorf("%s: %w", oldEntry.FullPath, filer_pb.ErrExistingIsFile)
+		}
+		// A local write to a remote-backed entry leaves the copy on remote
+		// stale until a sync re-uploads it. Content changes that arrive
+		// without a fresh sync stamp are unsynced; clear the stamp so nothing
+		// mistakes the still-local chunks for a re-fetchable cache copy.
+		// Replicated updates carry the writer's authoritative stamp.
+		if !isFromOtherCluster && oldEntry.Remote != nil && entry.Remote != nil &&
+			oldEntry.Remote.LastLocalSyncTsNs == entry.Remote.LastLocalSyncTsNs &&
+			!chunksEqual(oldEntry.Chunks, entry.Chunks) {
+			entry.Remote = proto.Clone(entry.Remote).(*filer_pb.RemoteEntry)
+			entry.Remote.LastLocalSyncTsNs = 0
 		}
 	}
 	if entry.Attr.Atime.IsZero() {
@@ -589,7 +671,7 @@ func (f *Filer) doListDirectoryEntries(ctx context.Context, p util.FullPath, sta
 	lastFileName, err = f.Store.ListDirectoryPrefixedEntries(ctx, p, startFileName, inclusive, limit, prefix, func(entry *Entry) (bool, error) {
 		select {
 		case <-ctx.Done():
-			glog.Errorf("Context is done.")
+			glog.V(1).InfofCtx(ctx, "listing %q canceled: %v", p, ctx.Err())
 			return false, fmt.Errorf("context canceled: %w", ctx.Err())
 		default:
 			if entry.TtlSec > 0 && !entry.IsDirectory() {
@@ -729,6 +811,9 @@ func (f *Filer) Shutdown() {
 	f.LocalMetaLogBuffer.ShutdownLogBuffer()
 	// The final metadata-log flush still needs the store to append its entry.
 	f.LocalMetaLogBuffer.WaitForShutdown()
+	// Persist the deletion ledger one last time before the store closes, so a
+	// clean shutdown leaves the recovery set exactly consistent with reality.
+	f.snapshotDeletionLedger()
 	f.Store.Shutdown()
 }
 

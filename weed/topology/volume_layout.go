@@ -65,6 +65,7 @@ type VolumeLayout struct {
 	writableMembers  map[needle.VolumeId]struct{}
 	crowded          map[needle.VolumeId]struct{}
 	vacuumedVolumes  map[needle.VolumeId]time.Time
+	deletingVolumes  map[needle.VolumeId]struct{}
 	volumeSizeLimit  uint64
 	replicationAsMin bool
 	accessLock       sync.RWMutex
@@ -92,6 +93,7 @@ func NewVolumeLayout(rp *super_block.ReplicaPlacement, ttl *needle.TTL, diskType
 		writableMembers:  make(map[needle.VolumeId]struct{}),
 		crowded:          make(map[needle.VolumeId]struct{}),
 		vacuumedVolumes:  make(map[needle.VolumeId]time.Time),
+		deletingVolumes:  make(map[needle.VolumeId]struct{}),
 		volumeSizeLimit:  volumeSizeLimit,
 		replicationAsMin: replicationAsMin,
 		sizeTracking:     make(map[needle.VolumeId]*volumeSizeTracking),
@@ -553,6 +555,30 @@ func (vl *VolumeLayout) DrainAndRemoveFromWritable(vid needle.VolumeId) {
 	vl.waitForPendingDrain(context.Background(), vid)
 }
 
+// MarkDeleting pins a volume out of the writable list for the duration of a
+// sweep delete. DrainAndRemoveFromWritable alone is not enough here: unlike a
+// compaction the volume disappears, so a heartbeat landing mid-delete must not
+// re-add it and let a write reach a replica whose siblings are already gone.
+func (vl *VolumeLayout) MarkDeleting(vid needle.VolumeId) {
+	vl.accessLock.Lock()
+	vl.deletingVolumes[vid] = struct{}{}
+	vl.removeFromWritable(vid)
+	vl.accessLock.Unlock()
+	vl.waitForPendingDrain(context.Background(), vid)
+}
+
+func (vl *VolumeLayout) UnmarkDeleting(vid needle.VolumeId) {
+	vl.accessLock.Lock()
+	delete(vl.deletingVolumes, vid)
+	// Re-run the standard writable gate so a surviving volume regains
+	// assignment immediately; digest heartbeats only re-report changed
+	// volumes, so waiting on them could strand it unwritable indefinitely.
+	if !vl.vid2location[vid].AnyOversized() && vl.enoughCopies(vid) && vl.isAllWritable(vid) {
+		vl.setVolumeWritable(vid)
+	}
+	vl.accessLock.Unlock()
+}
+
 func (vl *VolumeLayout) isEmpty() bool {
 	vl.accessLock.RLock()
 	defer vl.accessLock.RUnlock()
@@ -920,6 +946,9 @@ func (vl *VolumeLayout) removeFromWritable(vid needle.VolumeId) bool {
 	return false
 }
 func (vl *VolumeLayout) setVolumeWritable(vid needle.VolumeId) bool {
+	if _, ok := vl.deletingVolumes[vid]; ok {
+		return false
+	}
 	if _, ok := vl.writableMembers[vid]; ok {
 		return false
 	}
@@ -957,6 +986,21 @@ func (vl *VolumeLayout) SetVolumeWritable(dn *DataNode, vid needle.VolumeId) boo
 		return vl.setVolumeWritable(vid)
 	}
 	return false
+}
+
+// SetReplicaReadOnlyFlag records what dn's latest heartbeat said about its
+// replica of vid, and nothing more: the writable list is left to
+// EnsureCorrectWritables and its capacity guards. Until now the flag only moved
+// on registration and volume.mark, so a replica that went read-only, or came
+// back, while the server ran kept its stale flag until the next restart. The
+// vacuum sweep reads this flag when it decides whether to skip a volume.
+func (vl *VolumeLayout) SetReplicaReadOnlyFlag(dn *DataNode, vid needle.VolumeId, readOnly bool) {
+	vl.accessLock.Lock()
+	defer vl.accessLock.Unlock()
+
+	if location, ok := vl.vid2location[vid]; ok {
+		location.SetReadOnly(dn, readOnly)
+	}
 }
 
 func (vl *VolumeLayout) SetVolumeUnavailable(dn *DataNode, vid needle.VolumeId) bool {

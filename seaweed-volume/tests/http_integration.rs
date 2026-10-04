@@ -108,6 +108,9 @@ fn build_test_state(
         file_size_limit_bytes: 0,
         maintenance_byte_per_second: 0,
         is_heartbeating: std::sync::atomic::AtomicBool::new(true),
+        ec_decodes_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+        ec_decode_tail: std::sync::Mutex::new(std::collections::HashSet::new()),
+        ec_decode_tail_notify: tokio::sync::Notify::new(),
         has_master: false,
         pre_stop_seconds: 0,
         volume_state_notify: tokio::sync::Notify::new(),
@@ -475,6 +478,74 @@ async fn delete_then_get_returns_404() {
         StatusCode::NOT_FOUND,
         "GET after DELETE should return 404"
     );
+}
+
+// Go answers both with 500 and an error containing "volume N is read only"
+// (the write behind "failed to write to local disk: ").
+#[tokio::test]
+async fn write_and_delete_on_read_only_volume_say_is_read_only() {
+    let (state, _tmp) = test_state();
+    let uri = "/1,01637037d6";
+
+    let request = |method: &str, body: &[u8]| {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::from(body.to_vec()))
+            .unwrap()
+    };
+    let error_of = |body: Vec<u8>| -> String {
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        json["error"].as_str().unwrap_or_default().to_string()
+    };
+
+    let response = build_admin_router(state.clone())
+        .oneshot(request("POST", b"written before read-only"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    state
+        .store
+        .write()
+        .unwrap()
+        .find_volume_mut(VolumeId(1))
+        .unwrap()
+        .1
+        .set_no_write_or_delete(true);
+
+    let response = build_admin_router(state.clone())
+        .oneshot(request("POST", b"refused"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let error = error_of(body_bytes(response).await);
+    assert!(error.contains("volume 1 is read only"), "{error}");
+
+    let response = build_admin_router(state.clone())
+        .oneshot(request("DELETE", b""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        error_of(body_bytes(response).await),
+        "Deletion Failed: volume 1 is read only"
+    );
+
+    // The needle is still there to delete once the volume is writable again.
+    state
+        .store
+        .write()
+        .unwrap()
+        .find_volume_mut(VolumeId(1))
+        .unwrap()
+        .1
+        .set_no_write_or_delete(false);
+    let response = build_admin_router(state.clone())
+        .oneshot(request("DELETE", b""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
 }
 
 // ============================================================================
@@ -1254,4 +1325,103 @@ async fn non_ascii_fid_and_ttl_are_rejected_not_panicked() {
         statuses[0], statuses[1],
         "a non-ASCII ttl must behave like any other invalid ttl, not panic"
     );
+}
+
+// ============================================================================
+// The write queue answers an upload with the needle's real ETag
+//
+// The queue worker computes the CRC on the needle it was handed, so the handler
+// has to know the checksum before it submits. Without that every queued upload
+// came back as "00000000". The direct path is the reference: same payload, same
+// ETag, for a plain body and for one the handler gzips before storing.
+// ============================================================================
+
+#[tokio::test]
+async fn write_queue_upload_returns_same_etag_as_direct_write() {
+    use seaweed_volume::server::write_queue::WriteQueue;
+
+    let (direct_state, _direct_tmp) = test_state();
+    let (queued_state, _queued_tmp) = test_state();
+    let wq = WriteQueue::new(queued_state.clone(), 128);
+    let _ = queued_state.write_queue.set(wq);
+
+    let compressible = "seaweedfs ".repeat(200).into_bytes();
+    let uploads: [(&str, &[u8]); 2] = [
+        ("/1,01637037d6", b"hello, seaweedfs!"),
+        ("/1/02637037d6/notes.txt", &compressible),
+    ];
+
+    for (uri, payload) in uploads {
+        let mut etags = Vec::new();
+        for state in [&direct_state, &queued_state] {
+            let app = build_admin_router(state.clone());
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .body(Body::from(payload.to_vec()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+
+            let header = response
+                .headers()
+                .get("ETag")
+                .expect("upload response has no ETag")
+                .to_str()
+                .unwrap()
+                .to_string();
+            let body = body_bytes(response).await;
+            let json: serde_json::Value =
+                serde_json::from_slice(&body).expect("POST response is not valid JSON");
+            let etag = json["eTag"].as_str().unwrap().to_string();
+            assert_eq!(header, format!("\"{}\"", etag));
+            etags.push(etag);
+        }
+        assert_ne!(etags[0], "00000000", "{}: direct ETag is the zero CRC", uri);
+        assert_eq!(
+            etags[1], etags[0],
+            "{}: queued upload must return the direct path's ETag",
+            uri
+        );
+    }
+
+    // The second upload really was stored gzipped, so its ETag is the CRC of
+    // the compressed bytes on both paths.
+    let app = build_admin_router(queued_state.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(uploads[1].0)
+                .header("Accept-Encoding", "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["Content-Encoding"], "gzip");
+
+    // Re-uploading the same bytes is the unchanged path: 204 with the same ETag.
+    let (uri, payload) = uploads[0];
+    let mut etags = Vec::new();
+    for state in [&direct_state, &queued_state] {
+        let app = build_admin_router(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .body(Body::from(payload.to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        etags.push(response.headers()["ETag"].to_str().unwrap().to_string());
+    }
+    assert_eq!(etags[1], etags[0], "unchanged upload ETag differs");
 }

@@ -48,6 +48,11 @@ type DiskLocation struct {
 	// erasure coding
 	ecVolumes     map[needle.VolumeId]*erasure_coding.EcVolume
 	ecVolumesLock sync.RWMutex
+	// vids whose EcVolume was removed from ecVolumes but is still being
+	// destroyed off-lock; the channel closes when Destroy returns. A remount
+	// of the vid must wait for it, or the dying volume could unlink files
+	// the new one just opened.
+	ecVolumesDestroying map[needle.VolumeId]chan struct{}
 
 	ecShardNotifyHandler func(collection string, vid needle.VolumeId, shardId erasure_coding.ShardId, ecVolume *erasure_coding.EcVolume)
 
@@ -117,6 +122,7 @@ func NewDiskLocation(dir string, maxVolumeCount int32, minFreeSpace util.MinFree
 	}
 	location.volumes = make(map[needle.VolumeId]*Volume)
 	location.ecVolumes = make(map[needle.VolumeId]*erasure_coding.EcVolume)
+	location.ecVolumesDestroying = make(map[needle.VolumeId]chan struct{})
 	location.closeCh = make(chan struct{})
 	go func() {
 		location.CheckDiskSpace(config)
@@ -461,7 +467,7 @@ func (l *DiskLocation) DeleteCollectionFromDiskLocation(collection string) (dele
 	wg.Add(2)
 	go func() {
 		for k, v := range delVolsMap {
-			if err := v.Destroy(false, false); err != nil {
+			if err := v.Destroy(false, false, false); err != nil {
 				errChain <- err
 			} else {
 				l.volumesLock.Lock()
@@ -474,8 +480,12 @@ func (l *DiskLocation) DeleteCollectionFromDiskLocation(collection string) (dele
 	}()
 
 	go func() {
-		for _, v := range delEcVolsMap {
+		for k, v := range delEcVolsMap {
 			v.Destroy()
+			l.ecVolumesLock.Lock()
+			done := l.ecVolumesDestroying[k]
+			l.ecVolumesLock.Unlock()
+			close(done)
 		}
 		wg.Done()
 	}()
@@ -497,12 +507,12 @@ func (l *DiskLocation) DeleteCollectionFromDiskLocation(collection string) (dele
 	return
 }
 
-func (l *DiskLocation) deleteVolumeById(vid needle.VolumeId, onlyEmpty bool, keepRemoteData bool) (found bool, e error) {
+func (l *DiskLocation) deleteVolumeById(vid needle.VolumeId, onlyEmpty bool, onlyGarbage bool, keepRemoteData bool) (found bool, e error) {
 	v, ok := l.volumes[vid]
 	if !ok {
 		return
 	}
-	e = v.Destroy(onlyEmpty, keepRemoteData)
+	e = v.Destroy(onlyEmpty, onlyGarbage, keepRemoteData)
 	if e != nil {
 		return
 	}
@@ -528,7 +538,7 @@ func (l *DiskLocation) LoadVolume(diskId uint32, vid needle.VolumeId, needleMapK
 
 var ErrVolumeNotFound = fmt.Errorf("volume not found")
 
-func (l *DiskLocation) DeleteVolume(vid needle.VolumeId, onlyEmpty bool, keepRemoteData bool) error {
+func (l *DiskLocation) DeleteVolume(vid needle.VolumeId, onlyEmpty bool, onlyGarbage bool, keepRemoteData bool) error {
 	l.volumesLock.Lock()
 	defer l.volumesLock.Unlock()
 
@@ -536,7 +546,7 @@ func (l *DiskLocation) DeleteVolume(vid needle.VolumeId, onlyEmpty bool, keepRem
 	if !ok {
 		return ErrVolumeNotFound
 	}
-	_, err := l.deleteVolumeById(vid, onlyEmpty, keepRemoteData)
+	_, err := l.deleteVolumeById(vid, onlyEmpty, onlyGarbage, keepRemoteData)
 	return err
 }
 
@@ -649,10 +659,19 @@ func (l *DiskLocation) Close() {
 	l.volumesLock.Unlock()
 
 	l.ecVolumesLock.Lock()
-	for _, ecVolume := range l.ecVolumes {
-		ecVolume.Close()
+	ecVolumes := make([]*erasure_coding.EcVolume, 0, len(l.ecVolumes))
+	for vid, ecVolume := range l.ecVolumes {
+		ecVolumes = append(ecVolumes, ecVolume)
+		delete(l.ecVolumes, vid)
 	}
 	l.ecVolumesLock.Unlock()
+
+	// Close outside the write lock: EcVolume.Close takes the deletion-journal
+	// lock, which a running ec.decode can hold — closing under the map lock
+	// would stall every EC lookup and invert the map->journal lock order.
+	for _, ecVolume := range ecVolumes {
+		ecVolume.Close()
+	}
 
 	close(l.closeCh)
 	return

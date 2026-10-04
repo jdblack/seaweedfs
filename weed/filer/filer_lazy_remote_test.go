@@ -34,6 +34,10 @@ type stubFilerStore struct {
 	entries         map[string]*Entry
 	kv              map[string][]byte
 	insertErr       error
+	findErr         error
+	kvGetErr        error
+	kvDeleteErr     error
+	kvGetHook       func(key []byte)
 	deleteErrByPath map[string]error
 }
 
@@ -62,6 +66,12 @@ func (s *stubFilerStore) KvPut(_ context.Context, key []byte, value []byte) erro
 func (s *stubFilerStore) KvGet(_ context.Context, key []byte) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.kvGetHook != nil {
+		s.kvGetHook(key)
+	}
+	if s.kvGetErr != nil {
+		return nil, s.kvGetErr
+	}
 	value, found := s.kv[string(key)]
 	if !found {
 		return nil, ErrKvNotFound
@@ -71,6 +81,9 @@ func (s *stubFilerStore) KvGet(_ context.Context, key []byte) ([]byte, error) {
 func (s *stubFilerStore) KvDelete(_ context.Context, key []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.kvDeleteErr != nil {
+		return s.kvDeleteErr
+	}
 	delete(s.kv, string(key))
 	return nil
 }
@@ -174,6 +187,9 @@ func (s *stubFilerStore) UpdateEntry(_ context.Context, entry *Entry) error {
 func (s *stubFilerStore) FindEntry(_ context.Context, p util.FullPath) (*Entry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.findErr != nil {
+		return nil, s.findErr
+	}
 	if e, ok := s.entries[string(p)]; ok {
 		return e, nil
 	}
@@ -279,6 +295,7 @@ func newTestFiler(t *testing.T, store *stubFilerStore, rs *FilerRemoteStorage) *
 		MasterClient:        mc,
 		FileIdDeletionQueue: util.NewUnboundedQueue(),
 		deletionQuit:        make(chan struct{}),
+		remoteTombstones:    newRemoteDeletionTombstones(),
 		LocalMetaLogBuffer: log_buffer.NewLogBuffer("test", time.Minute,
 			func(*log_buffer.LogBuffer, time.Time, time.Time, []byte, int64, int64) {}, nil, func() {}),
 	}
