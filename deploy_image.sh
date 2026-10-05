@@ -68,7 +68,7 @@ PROJECT="${PROJECT:-jdblack}"
 IMAGE="${IMAGE:-jblack-seaweedfs}"
 PLATFORM="${PLATFORM:-linux/amd64}"
 TAGS="${TAGS:-}"
-WITH_RUST="${WITH_RUST:-${RUST:-0}}"
+WITH_RUST="${WITH_RUST:-${RUST:-1}}"
 SKIP_SMOKE="${SKIP_SMOKE:-0}"
 
 DO_PUSH=1
